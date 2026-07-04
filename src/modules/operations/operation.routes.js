@@ -41,6 +41,72 @@ const operationSelect = `
   JOIN companies c ON c.id = o.company_id
 `;
 
+router.get('/plate-lookup/:plate', allowRoles('CASHIER','OPERATOR','ADMIN'), async (req, res, next) => {
+  try {
+    const plateCheck = validatePlate(req.params.plate);
+    if (!plateCheck.ok) {
+      return res.json({ success: true, data: { exists: false, normalized_plate: plateCheck.normalized || normalizePlate(req.params.plate), valid_plate: false, message: plateCheck.message } });
+    }
+
+    const normalizedPlate = plateCheck.normalized;
+    const [rows] = await pool.execute(`
+      SELECT
+        v.id AS vehicle_id,
+        v.normalized_plate,
+        v.display_plate,
+        v.vehicle_type_id,
+        v.active AS vehicle_active,
+        vt.name AS vehicle_type_name,
+        vt.code AS vehicle_type_code,
+        vt.requires_load_status,
+        lo.driver_name,
+        lo.driver_document,
+        lo.driver_phone,
+        lo.created_at_utc AS last_operation_at_utc
+      FROM vehicles v
+      JOIN vehicle_types vt ON vt.id = v.vehicle_type_id
+      LEFT JOIN operations lo ON lo.id = (
+        SELECT o2.id
+        FROM operations o2
+        JOIN trips tr2 ON tr2.id = o2.trip_id
+        WHERE o2.vehicle_id = v.id
+          AND o2.active_in_trip = 1
+          AND o2.status NOT IN ('ANNULLED','REMOVED')
+          AND tr2.deleted_at_utc IS NULL
+        ORDER BY o2.created_at_utc DESC, o2.id DESC
+        LIMIT 1
+      )
+      WHERE v.normalized_plate = ?
+      LIMIT 1
+    `, [normalizedPlate]);
+
+    const vehicle = rows[0];
+    if (!vehicle) {
+      return res.json({ success: true, data: { exists: false, normalized_plate: normalizedPlate, valid_plate: true } });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        exists: true,
+        lock_type: true,
+        vehicle_id: vehicle.vehicle_id,
+        normalized_plate: vehicle.normalized_plate,
+        display_plate: vehicle.display_plate,
+        vehicle_type_id: vehicle.vehicle_type_id,
+        vehicle_type_name: vehicle.vehicle_type_name,
+        vehicle_type_code: vehicle.vehicle_type_code,
+        requires_load_status: !!vehicle.requires_load_status,
+        vehicle_active: !!vehicle.vehicle_active,
+        driver_name: vehicle.driver_name || '',
+        driver_document: vehicle.driver_document || '',
+        driver_phone: vehicle.driver_phone || '',
+        last_operation_at_utc: vehicle.last_operation_at_utc || null
+      }
+    });
+  } catch (error) { next(error); }
+});
+
 router.get('/trip/:tripId', async (req, res, next) => {
   try {
     const [rows] = await pool.execute(`
