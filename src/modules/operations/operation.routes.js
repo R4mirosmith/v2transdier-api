@@ -28,7 +28,7 @@ function ticketNumberFor(id) {
 const operationSelect = `
   SELECT o.*, vt.name AS vehicle_type_name, vt.code AS vehicle_type_code,
     rb.name AS registered_by_name, bb.name AS billed_by_name, u.name AS cashier_name, bu.name AS boarding_user_name,
-    t.route_id, r.name AS route_name, f.name AS ferry_name, c.business_name AS company_name, c.trade_name, c.nit, c.logo_path, c.address, c.phone, c.email, c.ticket_footer
+    t.route_id, r.name AS route_name, f.name AS ferry_name, c.business_name AS company_name, c.trade_name, c.nit, c.logo_path, c.address, c.phone, c.electronic_billing_phone_1, c.electronic_billing_phone_2, c.email, c.ticket_footer
   FROM operations o
   JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
   JOIN users rb ON rb.id = o.registered_by_user_id
