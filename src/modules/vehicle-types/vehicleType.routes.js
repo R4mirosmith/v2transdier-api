@@ -24,6 +24,14 @@ function bool01(value) {
   return value === true || value === 1 || value === '1' || value === 'true' ? 1 : 0;
 }
 
+
+function migrationErrorIfNeeded(error) {
+  if (error?.code === 'ER_BAD_FIELD_ERROR' && String(error?.message || '').includes('registration_restricted')) {
+    return new AppError(400, 'VEHICLE_TYPE_RESTRICTION_NEEDS_MIGRATION', 'La base de datos aún no tiene la columna de restricción. Ejecuta database/migration_restriccion_tipos_vehiculo_secretaria.sql.');
+  }
+  return null;
+}
+
 function amount(value, label) {
   const n = Number(value ?? 0);
   if (!Number.isFinite(n) || n < 0) throw new AppError(400, 'VALIDATION_ERROR', `${label} debe ser un valor válido mayor o igual a 0.`);
@@ -56,6 +64,7 @@ function mapTypes(rows) {
         code: row.code,
         name: row.name,
         requires_load_status: !!row.requires_load_status,
+        registration_restricted: !!row.registration_restricted,
         active: !!row.active,
         created_at_utc: row.created_at_utc,
         fares: [],
@@ -97,6 +106,7 @@ router.post('/', async (req, res, next) => {
     const name = text(req.body.name);
     const code = codeFrom(req.body.code || name);
     const requires = bool01(req.body.requires_load_status);
+    const restricted = bool01(req.body.registration_restricted ?? req.body.restricted ?? 0);
     const active = bool01(req.body.active ?? 1);
 
     if (!name) throw new AppError(400, 'VALIDATION_ERROR', 'El nombre del tipo de vehículo es obligatorio.');
@@ -105,9 +115,9 @@ router.post('/', async (req, res, next) => {
 
     await connection.beginTransaction();
     const [result] = await connection.execute(
-      `INSERT INTO vehicle_types (code, name, requires_load_status, active)
-       VALUES (?, ?, ?, ?)`,
-      [code, name, requires, active]
+      `INSERT INTO vehicle_types (code, name, requires_load_status, registration_restricted, active)
+       VALUES (?, ?, ?, ?, ?)`,
+      [code, name, requires, restricted, active]
     );
     const id = result.insertId;
 
@@ -123,6 +133,8 @@ router.post('/', async (req, res, next) => {
   } catch (error) {
     await connection.rollback();
     if (error?.code === 'ER_DUP_ENTRY') return next(new AppError(409, 'CODE_EXISTS', 'Ya existe un tipo de vehículo con ese código.'));
+    const migrationError = migrationErrorIfNeeded(error);
+    if (migrationError) return next(migrationError);
     next(error);
   } finally {
     connection.release();
@@ -139,6 +151,7 @@ router.put('/:id', async (req, res, next) => {
     const name = text(req.body.name);
     const code = codeFrom(req.body.code || name);
     const requires = bool01(req.body.requires_load_status);
+    const restricted = bool01(req.body.registration_restricted ?? req.body.restricted ?? current[0].registration_restricted);
     const active = bool01(req.body.active ?? current[0].active);
 
     if (!name) throw new AppError(400, 'VALIDATION_ERROR', 'El nombre del tipo de vehículo es obligatorio.');
@@ -147,8 +160,8 @@ router.put('/:id', async (req, res, next) => {
 
     await connection.beginTransaction();
     await connection.execute(
-      `UPDATE vehicle_types SET code = ?, name = ?, requires_load_status = ?, active = ? WHERE id = ?`,
-      [code, name, requires, active, id]
+      `UPDATE vehicle_types SET code = ?, name = ?, requires_load_status = ?, registration_restricted = ?, active = ? WHERE id = ?`,
+      [code, name, requires, restricted, active, id]
     );
 
     if (requires) {
@@ -163,6 +176,8 @@ router.put('/:id', async (req, res, next) => {
   } catch (error) {
     await connection.rollback();
     if (error?.code === 'ER_DUP_ENTRY') return next(new AppError(409, 'CODE_EXISTS', 'Ya existe otro tipo de vehículo con ese código.'));
+    const migrationError = migrationErrorIfNeeded(error);
+    if (migrationError) return next(migrationError);
     next(error);
   } finally {
     connection.release();

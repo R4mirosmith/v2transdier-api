@@ -66,6 +66,9 @@ router.post('/', async (req, res, next) => {
     res.status(201).json({ success: true, message: 'Usuario creado correctamente.', data: { id: result.insertId } });
   } catch (error) {
     if (error?.code === 'ER_DUP_ENTRY') return next(new AppError(409, 'USERNAME_EXISTS', 'Ya existe un usuario con ese nombre de acceso.'));
+    if ((error?.code === 'WARN_DATA_TRUNCATED' || error?.code === 'ER_TRUNCATED_WRONG_VALUE_FOR_FIELD') && String(error?.message || '').includes('role')) {
+      return next(new AppError(400, 'ROLE_ENUM_NEEDS_MIGRATION', 'La base de datos aún no permite este rol. Ejecuta la migración de roles para habilitar SECRETARIA.'));
+    }
     next(error);
   }
 });
@@ -105,6 +108,9 @@ router.put('/:id', async (req, res, next) => {
     res.json({ success: true, message: 'Usuario actualizado correctamente.' });
   } catch (error) {
     if (error?.code === 'ER_DUP_ENTRY') return next(new AppError(409, 'USERNAME_EXISTS', 'Ya existe otro usuario con ese nombre de acceso.'));
+    if ((error?.code === 'WARN_DATA_TRUNCATED' || error?.code === 'ER_TRUNCATED_WRONG_VALUE_FOR_FIELD') && String(error?.message || '').includes('role')) {
+      return next(new AppError(400, 'ROLE_ENUM_NEEDS_MIGRATION', 'La base de datos aún no permite este rol. Ejecuta la migración de roles para habilitar SECRETARIA.'));
+    }
     next(error);
   }
 });

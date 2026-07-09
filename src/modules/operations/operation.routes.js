@@ -59,6 +59,7 @@ router.get('/plate-lookup/:plate', allowRoles('CASHIER','OPERATOR','ADMIN'), asy
         vt.name AS vehicle_type_name,
         vt.code AS vehicle_type_code,
         vt.requires_load_status,
+        vt.*,
         lo.driver_name,
         lo.driver_document,
         lo.driver_phone,
@@ -97,6 +98,7 @@ router.get('/plate-lookup/:plate', allowRoles('CASHIER','OPERATOR','ADMIN'), asy
         vehicle_type_name: vehicle.vehicle_type_name,
         vehicle_type_code: vehicle.vehicle_type_code,
         requires_load_status: !!vehicle.requires_load_status,
+        registration_restricted: !!vehicle.registration_restricted,
         vehicle_active: !!vehicle.vehicle_active,
         driver_name: vehicle.driver_name || '',
         driver_document: vehicle.driver_document || '',
@@ -215,6 +217,16 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
           user_id: req.user.id
         });
       }
+
+      if (!existingVehicle && Number(vehicleType.registration_restricted) === 1) {
+        throw new AppError(403, 'VEHICLE_TYPE_RESTRICTED_FOR_NEW', `El tipo ${vehicleType.name} está restringido para vehículos nuevos. Pide al administrador que quite la restricción temporalmente para poder registrar esta placa.`, {
+          plate: normalizedPlate,
+          vehicle_type_id: vehicleTypeId,
+          vehicle_type_name: vehicleType.name,
+          user_id: req.user.id
+        });
+      }
+
       if (existingVehicle) {
         vehicleId = existingVehicle.id;
       } else {

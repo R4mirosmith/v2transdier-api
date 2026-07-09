@@ -57,6 +57,7 @@ router.get('/vehicle-types', async (_req, res, next) => {
           code: row.code,
           name: row.name,
           requires_load_status: !!row.requires_load_status,
+          registration_restricted: !!row.registration_restricted,
           fares: []
         });
       }
