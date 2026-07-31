@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import path from 'path';
+import fs from 'fs/promises';
 import { pool, withTransaction } from '../../db/pool.js';
 import { authRequired, allowRoles } from '../../middlewares/auth.js';
 import { upload, setUploadFolder } from '../../middlewares/upload.js';
@@ -14,6 +15,29 @@ router.use(authRequired);
 function filePathForDb(file, folder) {
   if (!file) return null;
   return `/uploads/${folder}/${path.basename(file.path)}`;
+}
+
+async function removeUploadedFile(file) {
+  if (!file?.path) return;
+  try {
+    await fs.unlink(file.path);
+  } catch (_error) {
+    // El archivo puede haber sido eliminado por el sistema o no existir.
+  }
+}
+
+function restrictionMigrationError(error) {
+  if (
+    error?.code === 'ER_NO_SUCH_TABLE'
+    && String(error?.message || '').includes('restricted_vehicle_registration_requests')
+  ) {
+    return new AppError(
+      400,
+      'RESTRICTED_VEHICLE_REQUESTS_NEED_MIGRATION',
+      'Falta la tabla de autorizaciones de vehículos restringidos. Ejecuta database/migration_autorizacion_vehiculos_restringidos.sql.'
+    );
+  }
+  return null;
 }
 
 async function notifyCritical(type, title, message, payload) {
@@ -219,12 +243,87 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
       }
 
       if (!existingVehicle && Number(vehicleType.registration_restricted) === 1) {
-        throw new AppError(403, 'VEHICLE_TYPE_RESTRICTED_FOR_NEW', `El tipo ${vehicleType.name} está restringido para vehículos nuevos. Pide al administrador que quite la restricción temporalmente para poder registrar esta placa.`, {
-          plate: normalizedPlate,
-          vehicle_type_id: vehicleTypeId,
-          vehicle_type_name: vehicleType.name,
-          user_id: req.user.id
-        });
+        const [pendingRows] = await conn.execute(`
+          SELECT rr.*, requester.name AS requested_by_name
+          FROM restricted_vehicle_registration_requests rr
+          JOIN users requester ON requester.id = rr.requested_by_user_id
+          WHERE rr.normalized_plate = ?
+            AND rr.vehicle_type_id = ?
+            AND rr.trip_id = ?
+            AND rr.status = 'PENDING'
+          ORDER BY rr.id DESC
+          LIMIT 1
+          FOR UPDATE
+        `, [normalizedPlate, vehicleTypeId, tripId]);
+
+        let request = pendingRows[0] || null;
+        let restrictionNotification = null;
+
+        if (!request) {
+          const [insertRequest] = await conn.execute(`
+            INSERT INTO restricted_vehicle_registration_requests (
+              normalized_plate,
+              display_plate,
+              vehicle_type_id,
+              trip_id,
+              requested_by_user_id
+            ) VALUES (?, ?, ?, ?, ?)
+          `, [normalizedPlate, displayPlate, vehicleTypeId, tripId, req.user.id]);
+
+          const requestId = insertRequest.insertId;
+          restrictionNotification = await createNotification(conn, {
+            type: 'vehicle:restriction_requested',
+            severity: 'WARNING',
+            title: 'Vehículo restringido pendiente',
+            message: `${req.user.name} solicita permitir la placa ${normalizedPlate} como ${vehicleType.name}.`,
+            payload: {
+              restriction_request_id: requestId,
+              restriction_request_status: 'PENDING',
+              plate: normalizedPlate,
+              display_plate: displayPlate,
+              vehicle_type_id: vehicleTypeId,
+              vehicle_type_name: vehicleType.name,
+              trip_id: tripId,
+              requested_by_user_id: req.user.id,
+              requested_by_name: req.user.name
+            }
+          });
+
+          await conn.execute(
+            'UPDATE restricted_vehicle_registration_requests SET notification_id = ? WHERE id = ?',
+            [restrictionNotification.id, requestId]
+          );
+
+          request = {
+            id: requestId,
+            normalized_plate: normalizedPlate,
+            display_plate: displayPlate,
+            vehicle_type_id: vehicleTypeId,
+            vehicle_type_name: vehicleType.name,
+            trip_id: tripId,
+            requested_by_user_id: req.user.id,
+            requested_by_name: req.user.name,
+            status: 'PENDING',
+            notification_id: restrictionNotification.id
+          };
+        }
+
+        return {
+          kind: 'RESTRICTION_PENDING',
+          request: {
+            id: request.id,
+            normalized_plate: request.normalized_plate,
+            display_plate: request.display_plate,
+            vehicle_type_id: request.vehicle_type_id,
+            vehicle_type_name: request.vehicle_type_name || vehicleType.name,
+            trip_id: request.trip_id,
+            requested_by_user_id: request.requested_by_user_id,
+            requested_by_name: request.requested_by_name || req.user.name,
+            status: request.status || 'PENDING',
+            notification_id: request.notification_id || null
+          },
+          notification: restrictionNotification
+        };
       }
 
       if (existingVehicle) {
@@ -288,10 +387,31 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
       return operation;
     });
 
+    if (result?.kind === 'RESTRICTION_PENDING') {
+      await removeUploadedFile(req.file);
+      if (result.notification) {
+        publishNotification(result.notification);
+        emitToAdmins('vehicle:restriction_requested', result.request);
+      }
+      return res.status(202).json({
+        success: true,
+        pending_approval: true,
+        message: result.notification
+          ? 'Este tipo tiene restricción. Se envió una solicitud al administrador para autorizar únicamente esta placa.'
+          : 'Ya existe una solicitud pendiente para esta placa. Espera la autorización del administrador.',
+        data: result.request
+      });
+    }
+
     publishNotification(pendingNotification);
     emitToAdmins('operation:registered', result);
     res.status(201).json({ success: true, data: result });
   } catch (error) {
+    const migrationError = restrictionMigrationError(error);
+    if (migrationError) {
+      await removeUploadedFile(req.file);
+      return next(migrationError);
+    }
     if (error?.code === 'ER_DUP_ENTRY') {
       await notifyCritical('vehicle:duplicate_attempt', 'Duplicado bloqueado', 'La base de datos bloqueó un duplicado por concurrencia.', { plate: normalizePlate(req.body.plate), trip_id: req.body.trip_id });
       return next(new AppError(409, 'DUPLICATE_VEHICLE_IN_TRIP', 'Este vehículo ya fue registrado en este trayecto.'));
