@@ -15,5 +15,10 @@ export const env = {
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '8h',
   frontendOrigin: process.env.FRONTEND_ORIGIN || 'http://localhost:5173',
   publicBaseUrl: process.env.PUBLIC_BASE_URL || 'http://localhost:4010',
-  uploadDir: process.env.UPLOAD_DIR || 'uploads'
+  uploadDir: process.env.UPLOAD_DIR || 'uploads',
+  webPush: {
+    subject: process.env.VAPID_SUBJECT || '',
+    publicKey: process.env.VAPID_PUBLIC_KEY || '',
+    privateKey: process.env.VAPID_PRIVATE_KEY || ''
+  }
 };

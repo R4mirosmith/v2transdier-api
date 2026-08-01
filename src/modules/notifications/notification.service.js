@@ -1,5 +1,6 @@
 import { pool } from '../../db/pool.js';
 import { emitToAdmins, emitToUser } from '../../sockets/index.js';
+import { sendPushNotification } from './push.service.js';
 
 export async function createNotification(connOrPool, data) {
   const executor = connOrPool || pool;
@@ -17,4 +18,9 @@ export function publishNotification(notification) {
   if (!notification) return;
   if (notification.user_id) emitToUser(notification.user_id, 'notification:new', notification);
   else emitToAdmins('notification:new', notification);
+
+  // El socket avisa cuando la plataforma está abierta. Web Push cubre segundo plano o app cerrada.
+  void sendPushNotification(notification).catch((error) => {
+    console.error('Error publicando notificación push:', error);
+  });
 }

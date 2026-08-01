@@ -4,6 +4,12 @@ import { authRequired, allowRoles } from '../../middlewares/auth.js';
 import { AppError } from '../../utils/errors.js';
 import { createNotification, publishNotification } from './notification.service.js';
 import { emitToAdmins, emitToUser } from '../../sockets/index.js';
+import {
+  getPushPublicConfig,
+  removePushSubscription,
+  savePushSubscription,
+  sendPushNotification
+} from './push.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -27,12 +33,30 @@ function mapNotification(row) {
     payload.restriction_request_resolved_by_name = row.restriction_request_resolved_by_name;
   }
 
-  const { payload_json: _payloadJson, ...notification } = row;
-  return { ...notification, payload };
+  const {
+    payload_json: _payloadJson,
+    user_read_at_utc: userReadAtUtc,
+    ...notification
+  } = row;
+  return {
+    ...notification,
+    read_at_utc: notification.user_id ? notification.read_at_utc : (userReadAtUtc || null),
+    payload
+  };
 }
 
 function migrationErrorIfNeeded(error) {
   const message = String(error?.message || '');
+  if (
+    error?.code === 'ER_NO_SUCH_TABLE'
+    && (message.includes('notification_reads') || message.includes('push_subscriptions'))
+  ) {
+    return new AppError(
+      400,
+      'PWA_NOTIFICATIONS_NEED_MIGRATION',
+      'Falta la estructura de notificaciones PWA. Ejecuta database/migration_notificaciones_push_pwa.sql.'
+    );
+  }
   if (
     error?.code === 'ER_NO_SUCH_TABLE'
     && message.includes('restricted_vehicle_registration_requests')
@@ -56,24 +80,127 @@ function migrationErrorIfNeeded(error) {
   return null;
 }
 
-router.get('/', allowRoles('ADMIN'), async (_req, res, next) => {
+
+router.get('/unread-count', allowRoles('ADMIN'), async (req, res, next) => {
+  try {
+    const [rows] = await pool.execute(`
+      SELECT COUNT(*) AS total
+      FROM restricted_vehicle_registration_requests
+      WHERE status = 'PENDING'
+    `);
+    res.json({ success: true, data: { count: Number(rows[0]?.total || 0) } });
+  } catch (error) { next(migrationErrorIfNeeded(error) || error); }
+});
+
+router.post('/read-all', allowRoles('ADMIN'), async (req, res, next) => {
+  try {
+    const [result] = await pool.execute(`
+      INSERT IGNORE INTO notification_reads (notification_id, user_id, read_at_utc)
+      SELECT n.id, ?, UTC_TIMESTAMP()
+      FROM notifications n
+      WHERE n.user_id IS NULL
+    `, [req.user.id]);
+    res.json({
+      success: true,
+      message: 'Notificaciones marcadas como vistas.',
+      data: { updated: Number(result.affectedRows || 0) }
+    });
+  } catch (error) { next(migrationErrorIfNeeded(error) || error); }
+});
+
+router.get('/push/config', allowRoles('ADMIN'), (_req, res) => {
+  res.json({ success: true, data: getPushPublicConfig() });
+});
+
+router.post('/push/subscribe', allowRoles('ADMIN'), async (req, res, next) => {
+  try {
+    const config = getPushPublicConfig();
+    if (!config.enabled) {
+      throw new AppError(
+        503,
+        'WEB_PUSH_NOT_CONFIGURED',
+        'Las notificaciones push aún no tienen configuradas las claves VAPID en el servidor.'
+      );
+    }
+
+    await savePushSubscription(req.user.id, req.body?.subscription, req.headers['user-agent']);
+    res.json({ success: true, message: 'Alertas del dispositivo activadas correctamente.' });
+  } catch (error) {
+    if (error?.code === 'ER_NO_SUCH_TABLE') {
+      return next(new AppError(
+        400,
+        'PUSH_SUBSCRIPTIONS_NEED_MIGRATION',
+        'Falta la tabla de suscripciones push. Ejecuta database/migration_notificaciones_push_pwa.sql.'
+      ));
+    }
+    if (error?.code === 'INVALID_PUSH_SUBSCRIPTION') {
+      return next(new AppError(400, error.code, error.message));
+    }
+    next(error);
+  }
+});
+
+router.post('/push/unsubscribe', allowRoles('ADMIN'), async (req, res, next) => {
+  try {
+    const endpoint = String(req.body?.endpoint || '').trim();
+    if (!endpoint) throw new AppError(400, 'VALIDATION_ERROR', 'El endpoint de la suscripción es obligatorio.');
+    await removePushSubscription(req.user.id, endpoint);
+    res.json({ success: true, message: 'Alertas de este dispositivo desactivadas.' });
+  } catch (error) {
+    if (error?.code === 'ER_NO_SUCH_TABLE') {
+      return next(new AppError(
+        400,
+        'PUSH_SUBSCRIPTIONS_NEED_MIGRATION',
+        'Falta la tabla de suscripciones push. Ejecuta database/migration_notificaciones_push_pwa.sql.'
+      ));
+    }
+    next(error);
+  }
+});
+
+router.post('/push/test', allowRoles('ADMIN'), async (req, res, next) => {
+  try {
+    const notification = {
+      id: `test-${Date.now()}`,
+      type: 'push:test',
+      severity: 'WARNING',
+      title: 'Prueba de alertas Transdier',
+      message: 'Las notificaciones de este dispositivo están funcionando correctamente.',
+      user_id: req.user.id,
+      payload: { test: true }
+    };
+    const result = await sendPushNotification(notification, { force: true });
+    if (!result.enabled) {
+      throw new AppError(503, 'WEB_PUSH_NOT_CONFIGURED', 'Las claves VAPID no están configuradas en el servidor.');
+    }
+    res.json({
+      success: true,
+      message: result.sent > 0 ? 'Notificación de prueba enviada.' : 'No hay una suscripción activa para este dispositivo.',
+      data: result
+    });
+  } catch (error) { next(error); }
+});
+
+router.get('/', allowRoles('ADMIN'), async (req, res, next) => {
   try {
     let rows;
     try {
       [rows] = await pool.execute(`
         SELECT
           n.*,
+          nr.read_at_utc AS user_read_at_utc,
           rr.id AS restriction_request_id,
           rr.status AS restriction_request_status,
           rr.resolved_at_utc AS restriction_request_resolved_at_utc,
           resolver.name AS restriction_request_resolved_by_name
         FROM notifications n
+        LEFT JOIN notification_reads nr ON nr.notification_id = n.id AND nr.user_id = ?
         LEFT JOIN restricted_vehicle_registration_requests rr ON rr.notification_id = n.id
         LEFT JOIN users resolver ON resolver.id = rr.resolved_by_user_id
         WHERE n.user_id IS NULL
         ORDER BY n.id DESC
         LIMIT 100
-      `);
+      `, [req.user.id]);
     } catch (error) {
       if (error?.code !== 'ER_NO_SUCH_TABLE') throw error;
       [rows] = await pool.execute(`
@@ -173,10 +300,11 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
       `, [vehicleId, req.user.id, request.id]);
 
       if (request.notification_id) {
-        await conn.execute(
-          'UPDATE notifications SET read_at_utc = COALESCE(read_at_utc, UTC_TIMESTAMP()) WHERE id = ?',
-          [request.notification_id]
-        );
+        await conn.execute(`
+          INSERT INTO notification_reads (notification_id, user_id, read_at_utc)
+          VALUES (?, ?, UTC_TIMESTAMP())
+          ON DUPLICATE KEY UPDATE read_at_utc = VALUES(read_at_utc)
+        `, [request.notification_id, req.user.id]);
       }
 
       requesterNotification = await createNotification(conn, {
@@ -243,9 +371,13 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
 
 router.post('/:id/read', allowRoles('ADMIN'), async (req, res, next) => {
   try {
-    await pool.execute('UPDATE notifications SET read_at_utc = UTC_TIMESTAMP() WHERE id = ?', [req.params.id]);
+    await pool.execute(`
+      INSERT INTO notification_reads (notification_id, user_id, read_at_utc)
+      VALUES (?, ?, UTC_TIMESTAMP())
+      ON DUPLICATE KEY UPDATE read_at_utc = VALUES(read_at_utc)
+    `, [req.params.id, req.user.id]);
     res.json({ success: true, message: 'Notificación marcada como leída.' });
-  } catch (error) { next(error); }
+  } catch (error) { next(migrationErrorIfNeeded(error) || error); }
 });
 
 export default router;
