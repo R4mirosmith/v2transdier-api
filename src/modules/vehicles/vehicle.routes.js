@@ -23,11 +23,15 @@ const listSelect = `
     v.normalized_plate,
     v.display_plate,
     v.vehicle_type_id,
+    v.vehicle_category_id,
     v.active,
     v.created_at_utc,
     v.updated_at_utc,
     vt.name AS vehicle_type_name,
     vt.code AS vehicle_type_code,
+    vc.name AS vehicle_category_name,
+    vc.code AS vehicle_category_code,
+    vc.plate_category,
     COALESCE(stats.operations_count, 0) AS operations_count,
     COALESCE(stats.active_operations_count, 0) AS active_operations_count,
     COALESCE(stats.total_income, 0) AS total_income,
@@ -40,6 +44,7 @@ const listSelect = `
     stats.last_driver_phone
   FROM vehicles v
   JOIN vehicle_types vt ON vt.id = v.vehicle_type_id
+  JOIN vehicle_categories vc ON vc.id = v.vehicle_category_id
   LEFT JOIN (
     SELECT
       o.vehicle_id,
@@ -70,8 +75,8 @@ router.get('/', async (req, res, next) => {
     if (!includeInactive) where.push('v.active = 1');
     if (q) {
       const like = `%${q}%`;
-      where.push(`(v.normalized_plate LIKE ? OR v.display_plate LIKE ? OR vt.name LIKE ? OR stats.last_driver_name LIKE ? OR stats.last_driver_document LIKE ?)`);
-      params.push(like, like, like, like, like);
+      where.push(`(v.normalized_plate LIKE ? OR v.display_plate LIKE ? OR vt.name LIKE ? OR vc.name LIKE ? OR stats.last_driver_name LIKE ? OR stats.last_driver_document LIKE ?)`);
+      params.push(like, like, like, like, like, like);
     }
     const [rows] = await pool.execute(`
       ${listSelect}
@@ -100,6 +105,8 @@ router.get('/:id/history', async (req, res, next) => {
         o.active_in_trip,
         o.created_at_utc,
         vt.name AS vehicle_type_name,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
         r.name AS route_name,
         f.name AS ferry_name,
         j.opened_at_utc AS journey_opened_at_utc,
@@ -107,6 +114,7 @@ router.get('/:id/history', async (req, res, next) => {
         bb.name AS billed_by_name
       FROM operations o
       JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
       JOIN trips t ON t.id = o.trip_id
       JOIN routes r ON r.id = t.route_id
       JOIN ferries f ON f.id = o.ferry_id
@@ -135,11 +143,22 @@ router.put('/:id', async (req, res, next) => {
       const displayPlate = text(req.body.display_plate || normalizedPlate).toUpperCase();
       const vehicleTypeId = Number(req.body.vehicle_type_id || current.vehicle_type_id);
       const active = bool01(req.body.active ?? current.active);
-      const syncOperations = req.body.sync_operations === undefined ? true : !!req.body.sync_operations;
+      const syncOperations = req.body.sync_operations === undefined ? false : !!req.body.sync_operations;
 
-      const [typeRows] = await conn.execute('SELECT * FROM vehicle_types WHERE id = ? LIMIT 1', [vehicleTypeId]);
+      const [typeRows] = await conn.execute(`
+        SELECT
+          vt.*,
+          vc.name AS vehicle_category_name,
+          vc.code AS vehicle_category_code,
+          vc.plate_category
+        FROM vehicle_types vt
+        JOIN vehicle_categories vc ON vc.id = vt.vehicle_category_id
+        WHERE vt.id = ?
+          AND vt.category_review_required = 0
+        LIMIT 1
+      `, [vehicleTypeId]);
       const vehicleType = typeRows[0];
-      if (!vehicleType) throw new AppError(400, 'INVALID_VEHICLE_TYPE', 'Tipo de vehículo inválido.');
+      if (!vehicleType) throw new AppError(400, 'INVALID_VEHICLE_TYPE', 'Tipo de vehículo inválido o pendiente de clasificación.');
 
       const plateTypeCheck = validatePlateMatchesVehicleType(normalizedPlate, vehicleType);
       if (!plateTypeCheck.ok) throw new AppError(400, 'PLATE_TYPE_MISMATCH', plateTypeCheck.message);
@@ -166,17 +185,20 @@ router.put('/:id', async (req, res, next) => {
       }
 
       await conn.execute(
-        `UPDATE vehicles SET normalized_plate = ?, display_plate = ?, vehicle_type_id = ?, active = ?, updated_at_utc = UTC_TIMESTAMP() WHERE id = ?`,
-        [normalizedPlate, displayPlate, vehicleTypeId, active, current.id]
+        `UPDATE vehicles
+         SET normalized_plate = ?, display_plate = ?, vehicle_type_id = ?, vehicle_category_id = ?,
+             active = ?, updated_at_utc = UTC_TIMESTAMP()
+         WHERE id = ?`,
+        [normalizedPlate, displayPlate, vehicleTypeId, vehicleType.vehicle_category_id, active, current.id]
       );
 
       let affectedOperations = 0;
       if (syncOperations) {
         const [updateOps] = await conn.execute(
           `UPDATE operations
-             SET normalized_plate = ?, display_plate = ?, vehicle_type_id = ?
+             SET normalized_plate = ?, display_plate = ?, vehicle_type_id = ?, vehicle_category_id = ?
            WHERE vehicle_id = ?`,
-          [normalizedPlate, displayPlate, vehicleTypeId, current.id]
+          [normalizedPlate, displayPlate, vehicleTypeId, vehicleType.vehicle_category_id, current.id]
         );
         affectedOperations = updateOps.affectedRows || 0;
         await conn.execute(
@@ -184,8 +206,20 @@ router.put('/:id', async (req, res, next) => {
            SELECT id, 'VEHICLE_ADMIN_UPDATED', ?, ?
            FROM operations WHERE vehicle_id = ?`,
           [req.user.id, JSON.stringify({
-            from: { normalized_plate: current.normalized_plate, display_plate: current.display_plate, vehicle_type_id: current.vehicle_type_id, active: current.active },
-            to: { normalized_plate: normalizedPlate, display_plate: displayPlate, vehicle_type_id: vehicleTypeId, active },
+            from: {
+              normalized_plate: current.normalized_plate,
+              display_plate: current.display_plate,
+              vehicle_type_id: current.vehicle_type_id,
+              vehicle_category_id: current.vehicle_category_id,
+              active: current.active
+            },
+            to: {
+              normalized_plate: normalizedPlate,
+              display_plate: displayPlate,
+              vehicle_type_id: vehicleTypeId,
+              vehicle_category_id: vehicleType.vehicle_category_id,
+              active
+            },
             affected_operations: affectedOperations
           }), current.id]
         );
@@ -199,7 +233,16 @@ router.put('/:id', async (req, res, next) => {
         payload: { vehicle_id: current.id, normalized_plate: normalizedPlate, affected_operations: affectedOperations }
       });
 
-      return { id: current.id, normalized_plate: normalizedPlate, display_plate: displayPlate, vehicle_type_id: vehicleTypeId, active, affected_operations: affectedOperations };
+      return {
+        id: current.id,
+        normalized_plate: normalizedPlate,
+        display_plate: displayPlate,
+        vehicle_type_id: vehicleTypeId,
+        vehicle_category_id: vehicleType.vehicle_category_id,
+        vehicle_category_name: vehicleType.vehicle_category_name,
+        active,
+        affected_operations: affectedOperations
+      };
     });
     publishNotification(notification);
     emitToAdmins('vehicle:updated', result);

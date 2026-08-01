@@ -32,14 +32,25 @@ function mapNotification(row) {
 }
 
 function migrationErrorIfNeeded(error) {
+  const message = String(error?.message || '');
   if (
     error?.code === 'ER_NO_SUCH_TABLE'
-    && String(error?.message || '').includes('restricted_vehicle_registration_requests')
+    && message.includes('restricted_vehicle_registration_requests')
   ) {
     return new AppError(
       400,
       'RESTRICTED_VEHICLE_REQUESTS_NEED_MIGRATION',
       'Falta la tabla de autorizaciones de vehículos restringidos. Ejecuta database/migration_autorizacion_vehiculos_restringidos.sql.'
+    );
+  }
+  if (
+    (error?.code === 'ER_NO_SUCH_TABLE' && message.includes('vehicle_categories'))
+    || (error?.code === 'ER_BAD_FIELD_ERROR' && message.includes('vehicle_category_id'))
+  ) {
+    return new AppError(
+      400,
+      'VEHICLE_CATEGORIES_NEED_MIGRATION',
+      'La base de datos aún no tiene categorías reales de vehículos. Ejecuta database/migration_categorias_reales_vehiculos.sql.'
     );
   }
   return null;
@@ -84,9 +95,14 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
         SELECT
           rr.*,
           vt.name AS vehicle_type_name,
+          rr.vehicle_category_id,
+          vc.name AS vehicle_category_name,
+          vc.code AS vehicle_category_code,
+          vc.plate_category,
           requester.name AS requested_by_name
         FROM restricted_vehicle_registration_requests rr
         JOIN vehicle_types vt ON vt.id = rr.vehicle_type_id
+        JOIN vehicle_categories vc ON vc.id = rr.vehicle_category_id
         JOIN users requester ON requester.id = rr.requested_by_user_id
         WHERE rr.id = ?
         LIMIT 1
@@ -103,6 +119,8 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
           plate: request.normalized_plate,
           vehicle_type_id: request.vehicle_type_id,
           vehicle_type_name: request.vehicle_type_name,
+          vehicle_category_id: request.vehicle_category_id,
+          vehicle_category_name: request.vehicle_category_name,
           trip_id: request.trip_id,
           requested_by_user_id: request.requested_by_user_id,
           requested_by_name: request.requested_by_name,
@@ -121,21 +139,28 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
       );
       const existingVehicle = vehicleRows[0];
 
-      if (existingVehicle && Number(existingVehicle.vehicle_type_id) !== Number(request.vehicle_type_id)) {
+      if (existingVehicle && Number(existingVehicle.vehicle_category_id) !== Number(request.vehicle_category_id)) {
         throw new AppError(
           409,
-          'VEHICLE_TYPE_CONFLICT',
-          `La placa ${request.normalized_plate} ya existe con otro tipo de vehículo.`
+          'VEHICLE_CATEGORY_CONFLICT',
+          `La placa ${request.normalized_plate} ya existe con una categoría real diferente.`
         );
       }
 
       let vehicleId = existingVehicle?.id || null;
       if (!vehicleId) {
         const [insertVehicle] = await conn.execute(
-          'INSERT INTO vehicles (normalized_plate, display_plate, vehicle_type_id) VALUES (?, ?, ?)',
-          [request.normalized_plate, request.display_plate, request.vehicle_type_id]
+          `INSERT INTO vehicles (
+            normalized_plate, display_plate, vehicle_type_id, vehicle_category_id
+          ) VALUES (?, ?, ?, ?)`,
+          [request.normalized_plate, request.display_plate, request.vehicle_type_id, request.vehicle_category_id]
         );
         vehicleId = insertVehicle.insertId;
+      } else {
+        await conn.execute(
+          'UPDATE vehicles SET vehicle_type_id = ?, vehicle_category_id = ?, active = 1, updated_at_utc = UTC_TIMESTAMP() WHERE id = ?',
+          [request.vehicle_type_id, request.vehicle_category_id, vehicleId]
+        );
       }
 
       await conn.execute(`
@@ -168,6 +193,8 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
           vehicle_id: vehicleId,
           vehicle_type_id: request.vehicle_type_id,
           vehicle_type_name: request.vehicle_type_name,
+          vehicle_category_id: request.vehicle_category_id,
+          vehicle_category_name: request.vehicle_category_name,
           trip_id: request.trip_id,
           approved_by_user_id: req.user.id,
           approved_by_name: req.user.name
@@ -182,6 +209,8 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
         vehicle_id: vehicleId,
         vehicle_type_id: request.vehicle_type_id,
         vehicle_type_name: request.vehicle_type_name,
+        vehicle_category_id: request.vehicle_category_id,
+        vehicle_category_name: request.vehicle_category_name,
         trip_id: request.trip_id,
         requested_by_user_id: request.requested_by_user_id,
         requested_by_name: request.requested_by_name,

@@ -43,6 +43,7 @@ function operationWhereFromQuery(query, forceToday = false) {
   else if (query.journey_id) { where += ' AND o.journey_id = ?'; params.push(query.journey_id); }
   if (query.trip_id) { where += ' AND o.trip_id = ?'; params.push(query.trip_id); }
   if (query.vehicle_type_id) { where += ' AND o.vehicle_type_id = ?'; params.push(query.vehicle_type_id); }
+  if (query.vehicle_category_id) { where += ' AND o.vehicle_category_id = ?'; params.push(query.vehicle_category_id); }
 
   if (query.journey_from) {
     const { startUtc, endUtc } = fromColombiaDateRangeToUtc(query.journey_from, query.journey_to || query.journey_from);
@@ -58,12 +59,15 @@ function operationWhereFromQuery(query, forceToday = false) {
 }
 
 const operationsSelect = `
-  SELECT o.*, vt.name AS vehicle_type_name, u.name AS cashier_name, rb.name AS registered_by_name, bb.name AS billed_by_name,
+  SELECT o.*, vt.name AS vehicle_type_name,
+         vc.name AS vehicle_category_name, vc.code AS vehicle_category_code, vc.plate_category,
+         u.name AS cashier_name, rb.name AS registered_by_name, bb.name AS billed_by_name,
          f.name AS ferry_name, c.business_name AS company_name, r.name AS route_name,
          DATE_FORMAT(CONVERT_TZ(j.opened_at_utc, '+00:00', '-05:00'), '%Y-%m-%d') AS journey_local_date,
          t.opened_by_user_id, tu.name AS trip_opened_by_name, t.closed_by_user_id, tcu.name AS trip_closed_by_name
   FROM operations o
   JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+  JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
   JOIN users u ON u.id = o.cashier_user_id
   JOIN users rb ON rb.id = o.registered_by_user_id
   JOIN users bb ON bb.id = o.billed_by_user_id
@@ -198,6 +202,9 @@ router.get('/dashboard', allowRoles('ADMIN'), async (req, res, next) => {
         f.name AS ferry_name,
         o.vehicle_type_id,
         vt.name AS vehicle_type_name,
+        o.vehicle_category_id,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
         o.load_status,
         COUNT(o.id) AS qty,
         COALESCE(SUM(CASE WHEN o.status IN ('PAID','BOARDED') AND o.payment_method = 'CASH' THEN o.fare_price ELSE 0 END), 0) AS total
@@ -207,8 +214,10 @@ router.get('/dashboard', allowRoles('ADMIN'), async (req, res, next) => {
       JOIN routes r ON r.id = t.route_id
       JOIN ferries f ON f.id = o.ferry_id
       JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
       WHERE ${opFilter}
-      GROUP BY o.journey_id, journey_local_date, o.trip_id, t.route_id, r.name, f.id, f.name, o.vehicle_type_id, vt.name, o.load_status
+      GROUP BY o.journey_id, journey_local_date, o.trip_id, t.route_id, r.name, f.id, f.name,
+        o.vehicle_type_id, vt.name, o.vehicle_category_id, vc.name, vc.code, o.load_status
       ORDER BY journey_local_date DESC, f.name, o.trip_id DESC, vt.name, o.load_status
     `, opParams);
 
@@ -220,6 +229,9 @@ router.get('/dashboard', allowRoles('ADMIN'), async (req, res, next) => {
         f.name AS ferry_name,
         o.vehicle_type_id,
         vt.name AS vehicle_type_name,
+        o.vehicle_category_id,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
         o.load_status,
         COUNT(o.id) AS qty,
         COALESCE(SUM(CASE WHEN o.status IN ('PAID','BOARDED') AND o.payment_method = 'CASH' THEN o.fare_price ELSE 0 END), 0) AS total
@@ -228,9 +240,27 @@ router.get('/dashboard', allowRoles('ADMIN'), async (req, res, next) => {
       JOIN trips t ON t.id = o.trip_id
       JOIN ferries f ON f.id = o.ferry_id
       JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
       WHERE ${opFilter}
-      GROUP BY o.journey_id, journey_local_date, f.id, f.name, o.vehicle_type_id, vt.name, o.load_status
+      GROUP BY o.journey_id, journey_local_date, f.id, f.name,
+        o.vehicle_type_id, vt.name, o.vehicle_category_id, vc.name, vc.code, o.load_status
       ORDER BY journey_local_date DESC, f.name, vt.name, o.load_status
+    `, opParams);
+
+    const [categoryTotals] = await pool.execute(`
+      SELECT
+        o.vehicle_category_id,
+        vc.code AS vehicle_category_code,
+        vc.name AS vehicle_category_name,
+        COUNT(o.id) AS qty,
+        COALESCE(SUM(CASE WHEN o.status IN ('PAID','BOARDED') AND o.payment_method = 'CASH' THEN o.fare_price ELSE 0 END), 0) AS total
+      FROM operations o
+      JOIN trips t ON t.id = o.trip_id
+      JOIN journeys j ON j.id = o.journey_id
+      JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
+      WHERE ${opFilter}
+      GROUP BY o.vehicle_category_id, vc.code, vc.name
+      ORDER BY vc.name
     `, opParams);
 
     const [billedByTotals] = await pool.execute(`
@@ -274,6 +304,7 @@ router.get('/dashboard', allowRoles('ADMIN'), async (req, res, next) => {
         journey_ferry_totals: journeyFerryTotals,
         journey_ferry_type_totals: journeyFerryTypeTotals,
         trip_type_totals: tripTypeTotals,
+        category_totals: categoryTotals,
         operations_detail: dashboardOperations,
         billed_by_totals: billedByTotals
       }
@@ -296,12 +327,15 @@ router.get('/journey/:journeyId/summary', allowRoles('ADMIN'), async (req, res, 
       WHERE o.journey_id = ? AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED') AND t.deleted_at_utc IS NULL
     `, [req.params.journeyId]);
     const [byType] = await pool.execute(`
-      SELECT o.vehicle_type_id, vt.name, o.load_status, COUNT(*) AS qty, SUM(o.fare_price) AS total
+      SELECT o.vehicle_type_id, vt.name,
+        o.vehicle_category_id, vc.name AS vehicle_category_name, vc.code AS vehicle_category_code,
+        o.load_status, COUNT(*) AS qty, SUM(o.fare_price) AS total
       FROM operations o
       JOIN trips t ON t.id = o.trip_id
       JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
       WHERE o.journey_id = ? AND o.status NOT IN ('ANNULLED','REMOVED') AND o.active_in_trip = 1 AND t.deleted_at_utc IS NULL
-      GROUP BY o.vehicle_type_id, vt.name, o.load_status
+      GROUP BY o.vehicle_type_id, vt.name, o.vehicle_category_id, vc.name, vc.code, o.load_status
       ORDER BY vt.name, o.load_status
     `, [req.params.journeyId]);
     const [trips] = await pool.execute(`
@@ -347,10 +381,14 @@ router.get('/trip/:tripId/summary', async (req, res, next) => {
       FROM operations o WHERE o.trip_id = ? AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED') AND EXISTS (SELECT 1 FROM trips tx WHERE tx.id = o.trip_id AND tx.deleted_at_utc IS NULL)
     `, [req.params.tripId]);
     const [byType] = await pool.execute(`
-      SELECT vt.name, COUNT(*) AS qty, SUM(o.fare_price) AS total
-      FROM operations o JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+      SELECT vt.name, o.vehicle_category_id,
+        vc.name AS vehicle_category_name, vc.code AS vehicle_category_code,
+        COUNT(*) AS qty, SUM(o.fare_price) AS total
+      FROM operations o
+      JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
       WHERE o.trip_id = ? AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED') AND EXISTS (SELECT 1 FROM trips tx WHERE tx.id = o.trip_id AND tx.deleted_at_utc IS NULL)
-      GROUP BY vt.name ORDER BY vt.name
+      GROUP BY vt.name, o.vehicle_category_id, vc.name, vc.code ORDER BY vc.name, vt.name
     `, [req.params.tripId]);
     res.json({ success: true, data: { summary: summary[0], by_type: byType } });
   } catch (error) { next(error); }
@@ -527,7 +565,8 @@ router.get('/operations/export', allowRoles('ADMIN'), async (req, res, next) => 
         { header: 'Ferry', key: 'ferry_name' },
         { header: 'Trayecto', key: 'route_name' },
         { header: 'Placa', key: 'normalized_plate' },
-        { header: 'Tipo', key: 'vehicle_type_name' },
+        { header: 'Categoría real', key: 'vehicle_category_name' },
+        { header: 'Tipo / tarifa comercial', key: 'vehicle_type_name' },
         { header: 'Condición', value: r => condicionTexto(r.load_status) },
         { header: 'Valor', key: 'fare_price' },
         { header: 'Estado', value: r => estadoOperacionTexto(r.status) },
@@ -599,6 +638,9 @@ async function buildFinancialReport(query) {
       o.display_plate,
       o.vehicle_type_id,
       vt.name AS vehicle_type_name,
+      o.vehicle_category_id,
+      vc.name AS vehicle_category_name,
+      vc.code AS vehicle_category_code,
       o.load_status,
       o.fare_price,
       o.payment_method,
@@ -623,6 +665,7 @@ async function buildFinancialReport(query) {
       tcu.name AS trip_closed_by_name
     FROM operations o
     JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+    JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
     JOIN ferries f ON f.id = o.ferry_id
     JOIN companies c ON c.id = o.company_id
     JOIN journeys j ON j.id = o.journey_id
@@ -798,6 +841,9 @@ async function buildFinancialReport(query) {
       user_trip_key: userTripKey,
       vehicle_type_id: o.vehicle_type_id,
       vehicle_type_name: o.vehicle_type_name,
+      vehicle_category_id: o.vehicle_category_id,
+      vehicle_category_name: o.vehicle_category_name,
+      vehicle_category_code: o.vehicle_category_code,
       load_status: o.load_status,
       qty: 0,
       total: 0
@@ -812,6 +858,9 @@ async function buildFinancialReport(query) {
       trip_key: tk2,
       vehicle_type_id: o.vehicle_type_id,
       vehicle_type_name: o.vehicle_type_name,
+      vehicle_category_id: o.vehicle_category_id,
+      vehicle_category_name: o.vehicle_category_name,
+      vehicle_category_code: o.vehicle_category_code,
       load_status: o.load_status,
       qty: 0,
       total: 0
@@ -856,7 +905,7 @@ async function buildFinancialReport(query) {
   for (const row of byTrip.values()) {
     row.types = tripTypes.filter(t => t.trip_key === String(row.trip_id || 'SIN_TRAYECTO_' + row.ferry_id));
     row.type_summary_text = row.types.length
-      ? row.types.map(t => `${t.qty} ${t.vehicle_type_name}${t.qty === 1 ? '' : 's'}`).join(', ')
+      ? row.types.map(t => `${t.qty} × ${t.vehicle_category_name || 'Sin categoría'} · ${t.vehicle_type_name}`).join(', ')
       : 'Sin vehículos';
   }
 
@@ -871,7 +920,7 @@ async function buildFinancialReport(query) {
     row.journey_income_total = Number(journeyTotal?.income_total || 0);
     row.types = userTripTypes.filter(t => t.user_trip_key === key);
     row.type_summary_text = row.types.length
-      ? row.types.map(t => `${t.qty} ${t.vehicle_type_name}${t.qty === 1 ? '' : 's'}`).join(', ')
+      ? row.types.map(t => `${t.qty} × ${t.vehicle_category_name || 'Sin categoría'} · ${t.vehicle_type_name}`).join(', ')
       : 'Sin vehículos';
   }
 
@@ -967,7 +1016,7 @@ router.get('/financial/export', allowRoles('ADMIN', 'SECRETARIA'), async (req, r
     rows.push({ section: '', concept: '', detail: '', qty: '', income: '', expenses: '', net: '', extra: '' });
 
     rows.push({ section: 'TICKETS', concept: 'Ticket/Placa', detail: 'Trayecto/Ferry', qty: 'Tipo', income: 'Valor', expenses: '', net: '', extra: 'Registró / Facturó' });
-    for (const o of report.operations) rows.push({ section: 'TICKETS', concept: `${o.ticket_number || o.invoice_number} · ${o.normalized_plate}`, detail: `${o.route_name} · ${o.ferry_name} · ${o.journey_local_date}`, qty: `${o.vehicle_type_name} · ${condicionTexto(o.load_status)}`, income: localMoney(o.payment_method === 'CASH' ? o.fare_price : 0), expenses: '', net: '', extra: `${o.registered_by_name} / ${o.billed_by_name}` });
+    for (const o of report.operations) rows.push({ section: 'TICKETS', concept: `${o.ticket_number || o.invoice_number} · ${o.normalized_plate}`, detail: `${o.route_name} · ${o.ferry_name} · ${o.journey_local_date}`, qty: `${o.vehicle_category_name || 'Sin categoría'} · ${o.vehicle_type_name} · ${condicionTexto(o.load_status)}`, income: localMoney(o.payment_method === 'CASH' ? o.fare_price : 0), expenses: '', net: '', extra: `${o.registered_by_name} / ${o.billed_by_name}` });
 
     sendHtmlTableExport(res, {
       filename: `transdier-reporte-financiero-${filter.from}-${filter.to}`,

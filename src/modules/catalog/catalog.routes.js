@@ -39,21 +39,34 @@ router.get('/routes', async (_req, res, next) => {
 router.get('/vehicle-types', async (_req, res, next) => {
   try {
     const [rows] = await pool.execute(`
-      SELECT vt.*, vf.load_status, vf.price
+      SELECT
+        vt.*,
+        vc.code AS vehicle_category_code,
+        vc.name AS vehicle_category_name,
+        vc.plate_category,
+        vf.load_status,
+        vf.price
       FROM vehicle_types vt
+      JOIN vehicle_categories vc ON vc.id = vt.vehicle_category_id
       LEFT JOIN vehicle_fares vf
         ON vf.vehicle_type_id = vt.id
        AND vf.active = 1
        AND ((vt.requires_load_status = 1 AND vf.load_status IN ('EMPTY','LOADED'))
          OR (vt.requires_load_status = 0 AND vf.load_status = 'NA'))
       WHERE vt.active = 1
-      ORDER BY vt.id, vf.load_status
+        AND vt.category_review_required = 0
+        AND vc.active = 1
+      ORDER BY vc.sort_order, vt.name, vt.id, vf.load_status
     `);
     const map = new Map();
     for (const row of rows) {
       if (!map.has(row.id)) {
         map.set(row.id, {
           id: row.id,
+          vehicle_category_id: row.vehicle_category_id,
+          vehicle_category_code: row.vehicle_category_code,
+          vehicle_category_name: row.vehicle_category_name,
+          plate_category: row.plate_category,
           code: row.code,
           name: row.name,
           requires_load_status: !!row.requires_load_status,

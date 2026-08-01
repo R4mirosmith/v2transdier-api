@@ -27,14 +27,22 @@ async function removeUploadedFile(file) {
 }
 
 function restrictionMigrationError(error) {
-  if (
-    error?.code === 'ER_NO_SUCH_TABLE'
-    && String(error?.message || '').includes('restricted_vehicle_registration_requests')
-  ) {
+  const message = String(error?.message || '');
+  if (error?.code === 'ER_NO_SUCH_TABLE' && message.includes('restricted_vehicle_registration_requests')) {
     return new AppError(
       400,
       'RESTRICTED_VEHICLE_REQUESTS_NEED_MIGRATION',
       'Falta la tabla de autorizaciones de vehículos restringidos. Ejecuta database/migration_autorizacion_vehiculos_restringidos.sql.'
+    );
+  }
+  if (
+    error?.code === 'ER_NO_SUCH_TABLE' && message.includes('vehicle_categories')
+    || error?.code === 'ER_BAD_FIELD_ERROR' && message.includes('vehicle_category_id')
+  ) {
+    return new AppError(
+      400,
+      'VEHICLE_CATEGORIES_NEED_MIGRATION',
+      'La base de datos aún no tiene categorías reales de vehículos. Ejecuta database/migration_categorias_reales_vehiculos.sql.'
     );
   }
   return null;
@@ -51,10 +59,12 @@ function ticketNumberFor(id) {
 
 const operationSelect = `
   SELECT o.*, vt.name AS vehicle_type_name, vt.code AS vehicle_type_code,
+    vc.name AS vehicle_category_name, vc.code AS vehicle_category_code, vc.plate_category,
     rb.name AS registered_by_name, bb.name AS billed_by_name, u.name AS cashier_name, bu.name AS boarding_user_name,
     t.route_id, r.name AS route_name, f.name AS ferry_name, c.business_name AS company_name, c.trade_name, c.nit, c.logo_path, c.address, c.phone, c.electronic_billing_phone_1, c.electronic_billing_phone_2, c.email, c.ticket_footer
   FROM operations o
   JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+  JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
   JOIN users rb ON rb.id = o.registered_by_user_id
   JOIN users bb ON bb.id = o.billed_by_user_id
   JOIN users u ON u.id = o.cashier_user_id
@@ -79,17 +89,22 @@ router.get('/plate-lookup/:plate', allowRoles('CASHIER','OPERATOR','ADMIN'), asy
         v.normalized_plate,
         v.display_plate,
         v.vehicle_type_id,
+        v.vehicle_category_id,
         v.active AS vehicle_active,
         vt.name AS vehicle_type_name,
         vt.code AS vehicle_type_code,
         vt.requires_load_status,
-        vt.*,
+        vt.registration_restricted,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
+        vc.plate_category,
         lo.driver_name,
         lo.driver_document,
         lo.driver_phone,
         lo.created_at_utc AS last_operation_at_utc
       FROM vehicles v
       JOIN vehicle_types vt ON vt.id = v.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = v.vehicle_category_id
       LEFT JOIN operations lo ON lo.id = (
         SELECT o2.id
         FROM operations o2
@@ -114,13 +129,17 @@ router.get('/plate-lookup/:plate', allowRoles('CASHIER','OPERATOR','ADMIN'), asy
       success: true,
       data: {
         exists: true,
-        lock_type: true,
+        lock_category: true,
         vehicle_id: vehicle.vehicle_id,
         normalized_plate: vehicle.normalized_plate,
         display_plate: vehicle.display_plate,
         vehicle_type_id: vehicle.vehicle_type_id,
         vehicle_type_name: vehicle.vehicle_type_name,
         vehicle_type_code: vehicle.vehicle_type_code,
+        vehicle_category_id: vehicle.vehicle_category_id,
+        vehicle_category_name: vehicle.vehicle_category_name,
+        vehicle_category_code: vehicle.vehicle_category_code,
+        plate_category: vehicle.plate_category,
         requires_load_status: !!vehicle.requires_load_status,
         registration_restricted: !!vehicle.registration_restricted,
         vehicle_active: !!vehicle.vehicle_active,
@@ -196,9 +215,23 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
         throw new AppError(400, 'TRIP_NOT_WORKABLE', 'El trayecto no está disponible para facturar. Solo el admin puede agregar vehículos a un trayecto cerrado.');
       }
 
-      const [typeRows] = await conn.execute('SELECT * FROM vehicle_types WHERE id = ? AND active = 1', [vehicleTypeId]);
+      const [typeRows] = await conn.execute(`
+        SELECT
+          vt.*,
+          vc.name AS vehicle_category_name,
+          vc.code AS vehicle_category_code,
+          vc.plate_category,
+          vc.active AS vehicle_category_active
+        FROM vehicle_types vt
+        JOIN vehicle_categories vc ON vc.id = vt.vehicle_category_id
+        WHERE vt.id = ?
+          AND vt.active = 1
+          AND vt.category_review_required = 0
+          AND vc.active = 1
+        LIMIT 1
+      `, [vehicleTypeId]);
       const vehicleType = typeRows[0];
-      if (!vehicleType) throw new AppError(400, 'INVALID_VEHICLE_TYPE', 'Tipo de vehículo inválido.');
+      if (!vehicleType) throw new AppError(400, 'INVALID_VEHICLE_TYPE', 'El tipo comercial no existe, está inactivo o aún no tiene una categoría real válida.');
 
       const plateTypeCheck = validatePlateMatchesVehicleType(normalizedPlate, vehicleType);
       if (!plateTypeCheck.ok) {
@@ -229,17 +262,27 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
       let vehicleId;
       const [vehicleRows] = await conn.execute('SELECT * FROM vehicles WHERE normalized_plate = ? FOR UPDATE', [normalizedPlate]);
       const existingVehicle = vehicleRows[0];
-      if (existingVehicle && Number(existingVehicle.vehicle_type_id) !== vehicleTypeId) {
-        const [oldTypeRows] = await conn.execute('SELECT name FROM vehicle_types WHERE id = ?', [existingVehicle.vehicle_type_id]);
-        const oldTypeName = oldTypeRows[0]?.name || 'otro tipo';
-        throw new AppError(409, 'VEHICLE_TYPE_CONFLICT', `La placa ${normalizedPlate} ya está registrada como ${oldTypeName}. No puede registrarse como ${vehicleType.name}.`, {
-          plate: normalizedPlate,
-          old_vehicle_type_id: existingVehicle.vehicle_type_id,
-          old_vehicle_type_name: oldTypeName,
-          attempted_vehicle_type_id: vehicleTypeId,
-          attempted_vehicle_type_name: vehicleType.name,
-          user_id: req.user.id
-        });
+      if (existingVehicle && Number(existingVehicle.vehicle_category_id) !== Number(vehicleType.vehicle_category_id)) {
+        const [oldCategoryRows] = await conn.execute(
+          'SELECT name, code FROM vehicle_categories WHERE id = ? LIMIT 1',
+          [existingVehicle.vehicle_category_id]
+        );
+        const oldCategoryName = oldCategoryRows[0]?.name || 'otra categoría';
+        throw new AppError(
+          409,
+          'VEHICLE_CATEGORY_CONFLICT',
+          `La placa ${normalizedPlate} está registrada como ${oldCategoryName}. No puede cobrarse como ${vehicleType.vehicle_category_name}.`,
+          {
+            plate: normalizedPlate,
+            old_vehicle_category_id: existingVehicle.vehicle_category_id,
+            old_vehicle_category_name: oldCategoryName,
+            attempted_vehicle_category_id: vehicleType.vehicle_category_id,
+            attempted_vehicle_category_name: vehicleType.vehicle_category_name,
+            attempted_vehicle_type_id: vehicleTypeId,
+            attempted_vehicle_type_name: vehicleType.name,
+            user_id: req.user.id
+          }
+        );
       }
 
       if (!existingVehicle && Number(vehicleType.registration_restricted) === 1) {
@@ -249,12 +292,13 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
           JOIN users requester ON requester.id = rr.requested_by_user_id
           WHERE rr.normalized_plate = ?
             AND rr.vehicle_type_id = ?
+            AND rr.vehicle_category_id = ?
             AND rr.trip_id = ?
             AND rr.status = 'PENDING'
           ORDER BY rr.id DESC
           LIMIT 1
           FOR UPDATE
-        `, [normalizedPlate, vehicleTypeId, tripId]);
+        `, [normalizedPlate, vehicleTypeId, vehicleType.vehicle_category_id, tripId]);
 
         let request = pendingRows[0] || null;
         let restrictionNotification = null;
@@ -265,10 +309,11 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
               normalized_plate,
               display_plate,
               vehicle_type_id,
+              vehicle_category_id,
               trip_id,
               requested_by_user_id
-            ) VALUES (?, ?, ?, ?, ?)
-          `, [normalizedPlate, displayPlate, vehicleTypeId, tripId, req.user.id]);
+            ) VALUES (?, ?, ?, ?, ?, ?)
+          `, [normalizedPlate, displayPlate, vehicleTypeId, vehicleType.vehicle_category_id, tripId, req.user.id]);
 
           const requestId = insertRequest.insertId;
           restrictionNotification = await createNotification(conn, {
@@ -283,6 +328,8 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
               display_plate: displayPlate,
               vehicle_type_id: vehicleTypeId,
               vehicle_type_name: vehicleType.name,
+              vehicle_category_id: vehicleType.vehicle_category_id,
+              vehicle_category_name: vehicleType.vehicle_category_name,
               trip_id: tripId,
               requested_by_user_id: req.user.id,
               requested_by_name: req.user.name
@@ -300,6 +347,8 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
             display_plate: displayPlate,
             vehicle_type_id: vehicleTypeId,
             vehicle_type_name: vehicleType.name,
+            vehicle_category_id: vehicleType.vehicle_category_id,
+            vehicle_category_name: vehicleType.vehicle_category_name,
             trip_id: tripId,
             requested_by_user_id: req.user.id,
             requested_by_name: req.user.name,
@@ -316,6 +365,8 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
             display_plate: request.display_plate,
             vehicle_type_id: request.vehicle_type_id,
             vehicle_type_name: request.vehicle_type_name || vehicleType.name,
+            vehicle_category_id: request.vehicle_category_id || vehicleType.vehicle_category_id,
+            vehicle_category_name: request.vehicle_category_name || vehicleType.vehicle_category_name,
             trip_id: request.trip_id,
             requested_by_user_id: request.requested_by_user_id,
             requested_by_name: request.requested_by_name || req.user.name,
@@ -328,8 +379,19 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
 
       if (existingVehicle) {
         vehicleId = existingVehicle.id;
+        await conn.execute(
+          `UPDATE vehicles
+           SET display_plate = ?, vehicle_type_id = ?, vehicle_category_id = ?, active = 1, updated_at_utc = UTC_TIMESTAMP()
+           WHERE id = ?`,
+          [displayPlate, vehicleTypeId, vehicleType.vehicle_category_id, vehicleId]
+        );
       } else {
-        const [insertVehicle] = await conn.execute('INSERT INTO vehicles (normalized_plate, display_plate, vehicle_type_id) VALUES (?, ?, ?)', [normalizedPlate, displayPlate, vehicleTypeId]);
+        const [insertVehicle] = await conn.execute(
+          `INSERT INTO vehicles (
+            normalized_plate, display_plate, vehicle_type_id, vehicle_category_id
+          ) VALUES (?, ?, ?, ?)`,
+          [normalizedPlate, displayPlate, vehicleTypeId, vehicleType.vehicle_category_id]
+        );
         vehicleId = insertVehicle.insertId;
       }
 
@@ -363,11 +425,17 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
 
       const [insertOp] = await conn.execute(`
         INSERT INTO operations (
-          company_id, journey_id, trip_id, ferry_id, vehicle_id, normalized_plate, display_plate, vehicle_type_id, load_status,
+          company_id, journey_id, trip_id, ferry_id, vehicle_id, normalized_plate, display_plate,
+          vehicle_type_id, vehicle_category_id, load_status,
           driver_id, driver_name, driver_document, driver_phone, fare_price, payment_method, status,
           registered_by_user_id, billed_by_user_id, cashier_user_id, cash_session_id, optional_payment_photo_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [trip.company_id, trip.journey_id, tripId, trip.ferry_id, vehicleId, normalizedPlate, displayPlate, vehicleTypeId, loadStatus, driverId, driverName, driverDocument, driverPhone, price, paymentMethod, status, req.user.id, req.user.id, req.user.id, cashSession?.id || null, paymentPhotoPath]);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        trip.company_id, trip.journey_id, tripId, trip.ferry_id, vehicleId, normalizedPlate, displayPlate,
+        vehicleTypeId, vehicleType.vehicle_category_id, loadStatus,
+        driverId, driverName, driverDocument, driverPhone, price, paymentMethod, status,
+        req.user.id, req.user.id, req.user.id, cashSession?.id || null, paymentPhotoPath
+      ]);
 
       const opId = insertOp.insertId;
       const ticketNumber = ticketNumberFor(opId);
@@ -419,8 +487,8 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
     if (error?.code === 'DUPLICATE_VEHICLE_IN_TRIP') {
       await notifyCritical('vehicle:duplicate_attempt', 'Duplicado bloqueado', `Intentaron registrar nuevamente la placa ${normalizePlate(req.body.plate)} en el mismo trayecto.`, error.details || { plate: normalizePlate(req.body.plate), trip_id: req.body.trip_id });
     }
-    if (error?.code === 'VEHICLE_TYPE_CONFLICT') {
-      await notifyCritical('vehicle:type_conflict', 'Tipo de vehículo inválido', error.message, error.details || { plate: normalizePlate(req.body.plate), trip_id: req.body.trip_id });
+    if (error?.code === 'VEHICLE_TYPE_CONFLICT' || error?.code === 'VEHICLE_CATEGORY_CONFLICT') {
+      await notifyCritical('vehicle:category_conflict', 'Categoría de vehículo inválida', error.message, error.details || { plate: normalizePlate(req.body.plate), trip_id: req.body.trip_id });
     }
     if (error?.code === 'PLATE_TYPE_MISMATCH') {
       await notifyCritical('vehicle:plate_type_mismatch', 'Placa no coincide con el tipo', error.message, error.details || { plate: normalizePlate(req.body.plate), trip_id: req.body.trip_id });

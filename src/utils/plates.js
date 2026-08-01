@@ -42,9 +42,9 @@ export function classifyColombianPlate(plate) {
 }
 
 export function vehicleTypePlateCategory(vehicleType = {}) {
-  const code = String(vehicleType.code || '').toUpperCase();
-  const name = String(vehicleType.name || '').toUpperCase();
-  return code.includes('MOTO') || name.includes('MOTO') ? 'MOTORCYCLE' : 'VEHICLE';
+  const category = String(vehicleType.plate_category || '').toUpperCase();
+  if (category === 'MOTORCYCLE' || category === 'VEHICLE') return category;
+  return null;
 }
 
 export function validatePlate(plate) {
@@ -63,15 +63,26 @@ export function validatePlateMatchesVehicleType(plate, vehicleType) {
   if (!classified.ok) return classified;
 
   const expectedCategory = vehicleTypePlateCategory(vehicleType);
+  if (!expectedCategory) {
+    return {
+      ok: false,
+      normalized: classified.normalized,
+      category: classified.category,
+      expectedCategory: null,
+      message: `El tipo ${vehicleType?.name || 'seleccionado'} no tiene una categoría real válida. Corrígelo en Tipos de vehículo antes de usarlo.`
+    };
+  }
+
   if (classified.category !== expectedCategory) {
     const typeName = vehicleType?.name || 'el tipo seleccionado';
+    const categoryName = vehicleType?.vehicle_category_name || vehicleType?.category_name || 'su categoría real';
     if (expectedCategory === 'MOTORCYCLE') {
       return {
         ok: false,
         normalized: classified.normalized,
         category: classified.category,
         expectedCategory,
-        message: `La placa ${classified.normalized} tiene formato de vehículo/carro. No puede registrarse como ${typeName}. Para moto usa 3 letras + 2 números + 1 letra, ejemplo ABC12D.`
+        message: `La placa ${classified.normalized} tiene formato de vehículo/carro. ${typeName} pertenece a la categoría ${categoryName} y exige placa de moto, ejemplo ABC12D.`
       };
     }
     return {
@@ -79,7 +90,7 @@ export function validatePlateMatchesVehicleType(plate, vehicleType) {
       normalized: classified.normalized,
       category: classified.category,
       expectedCategory,
-      message: `La placa ${classified.normalized} tiene formato de moto. No puede registrarse como ${typeName}. Para vehículos usa 3 letras + 3 números, ejemplo ABC123.`
+      message: `La placa ${classified.normalized} tiene formato de moto. ${typeName} pertenece a la categoría ${categoryName} y exige placa de vehículo, ejemplo ABC123.`
     };
   }
 

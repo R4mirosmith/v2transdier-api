@@ -124,7 +124,11 @@ router.get('/export', allowRoles('ADMIN'), async (req, res, next) => {
         du.name AS trip_deleted_by_name,
         t.delete_reason,
         o.id AS operation_id, o.ticket_number, o.invoice_number, o.normalized_plate,
-        vt.name AS vehicle_type_name, o.load_status, o.fare_price, o.payment_method, o.status AS operation_status,
+        vt.name AS vehicle_type_name,
+        o.vehicle_category_id,
+        vc.code AS vehicle_category_code,
+        vc.name AS vehicle_category_name,
+        o.load_status, o.fare_price, o.payment_method, o.status AS operation_status,
         o.active_in_trip, o.created_at_utc AS operation_created_at_utc,
         rb.name AS registered_by_name,
         bb.name AS billed_by_name,
@@ -140,6 +144,7 @@ router.get('/export', allowRoles('ADMIN'), async (req, res, next) => {
       LEFT JOIN users du ON du.id = t.deleted_by_user_id
       LEFT JOIN operations o ON o.trip_id = t.id AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED')
       LEFT JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+      LEFT JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
       LEFT JOIN users rb ON rb.id = o.registered_by_user_id
       LEFT JOIN users bb ON bb.id = o.billed_by_user_id
       LEFT JOIN users rem ON rem.id = o.removed_from_trip_by_user_id
@@ -163,7 +168,8 @@ router.get('/export', allowRoles('ADMIN'), async (req, res, next) => {
         { header: 'Cerró trayecto', key: 'trip_closed_by_name' },
         { header: 'Ticket', value: r => r.ticket_number || r.invoice_number || '' },
         { header: 'Placa', key: 'normalized_plate' },
-        { header: 'Tipo', key: 'vehicle_type_name' },
+        { header: 'Categoría real', key: 'vehicle_category_name' },
+        { header: 'Tipo / tarifa comercial', key: 'vehicle_type_name' },
         { header: 'Condición', key: 'load_status' },
         { header: 'Valor', key: 'fare_price' },
         { header: 'Estado ticket', key: 'operation_status' },
@@ -202,11 +208,13 @@ router.get('/journey/:journeyId/detail', async (req, res, next) => {
 
     const [operations] = await pool.execute(`
       SELECT o.*, vt.name AS vehicle_type_name, vt.code AS vehicle_type_code,
+        vc.name AS vehicle_category_name, vc.code AS vehicle_category_code, vc.plate_category,
         r.name AS route_name, f.name AS ferry_name,
         rb.name AS registered_by_name, bb.name AS billed_by_name, cu.name AS cashier_name,
         rem.name AS removed_by_name
       FROM operations o
       JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
       JOIN trips t ON t.id = o.trip_id
       JOIN routes r ON r.id = t.route_id
       JOIN ferries f ON f.id = o.ferry_id

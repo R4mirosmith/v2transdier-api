@@ -24,9 +24,22 @@ function bool01(value) {
   return value === true || value === 1 || value === '1' || value === 'true' ? 1 : 0;
 }
 
-
 function migrationErrorIfNeeded(error) {
-  if (error?.code === 'ER_BAD_FIELD_ERROR' && String(error?.message || '').includes('registration_restricted')) {
+  const message = String(error?.message || '');
+  if (
+    error?.code === 'ER_NO_SUCH_TABLE' && message.includes('vehicle_categories')
+    || error?.code === 'ER_BAD_FIELD_ERROR' && (
+      message.includes('vehicle_category_id')
+      || message.includes('category_review_required')
+    )
+  ) {
+    return new AppError(
+      400,
+      'VEHICLE_CATEGORIES_NEED_MIGRATION',
+      'La base de datos aún no tiene las categorías reales de vehículos. Ejecuta database/migration_categorias_reales_vehiculos.sql.'
+    );
+  }
+  if (error?.code === 'ER_BAD_FIELD_ERROR' && message.includes('registration_restricted')) {
     return new AppError(400, 'VEHICLE_TYPE_RESTRICTION_NEEDS_MIGRATION', 'La base de datos aún no tiene la columna de restricción. Ejecuta database/migration_restriccion_tipos_vehiculo_secretaria.sql.');
   }
   return null;
@@ -46,6 +59,21 @@ async function codeExists(code, excludeId = null) {
   return rows.length > 0;
 }
 
+async function getCategory(connection, categoryId) {
+  const [rows] = await connection.execute(
+    `SELECT id, code, name, plate_category, active
+     FROM vehicle_categories
+     WHERE id = ?
+     LIMIT 1`,
+    [categoryId]
+  );
+  const category = rows[0];
+  if (!category || Number(category.active) !== 1) {
+    throw new AppError(400, 'INVALID_VEHICLE_CATEGORY', 'Selecciona una categoría real de vehículo válida y activa.');
+  }
+  return category;
+}
+
 async function upsertFare(connection, vehicleTypeId, loadStatus, price) {
   await connection.execute(
     `INSERT INTO vehicle_fares (vehicle_type_id, load_status, price, active)
@@ -61,10 +89,15 @@ function mapTypes(rows) {
     if (!map.has(row.id)) {
       map.set(row.id, {
         id: row.id,
+        vehicle_category_id: row.vehicle_category_id,
+        vehicle_category_code: row.vehicle_category_code,
+        vehicle_category_name: row.vehicle_category_name,
+        plate_category: row.plate_category,
         code: row.code,
         name: row.name,
         requires_load_status: !!row.requires_load_status,
         registration_restricted: !!row.registration_restricted,
+        category_review_required: !!row.category_review_required,
         active: !!row.active,
         created_at_utc: row.created_at_utc,
         fares: [],
@@ -84,20 +117,48 @@ function mapTypes(rows) {
   return Array.from(map.values());
 }
 
+router.get('/categories', async (_req, res, next) => {
+  try {
+    const [rows] = await pool.execute(`
+      SELECT id, code, name, plate_category, active, sort_order
+      FROM vehicle_categories
+      WHERE active = 1
+      ORDER BY sort_order, name
+    `);
+    res.json({ success: true, data: rows.map((row) => ({ ...row, active: !!row.active })) });
+  } catch (error) {
+    const migrationError = migrationErrorIfNeeded(error);
+    if (migrationError) return next(migrationError);
+    next(error);
+  }
+});
+
 router.get('/', async (_req, res, next) => {
   try {
     const [rows] = await pool.execute(`
-      SELECT vt.*, vf.load_status, vf.price, vf.active AS fare_active
+      SELECT
+        vt.*,
+        vc.code AS vehicle_category_code,
+        vc.name AS vehicle_category_name,
+        vc.plate_category,
+        vf.load_status,
+        vf.price,
+        vf.active AS fare_active
       FROM vehicle_types vt
+      JOIN vehicle_categories vc ON vc.id = vt.vehicle_category_id
       LEFT JOIN vehicle_fares vf
         ON vf.vehicle_type_id = vt.id
        AND vf.active = 1
        AND ((vt.requires_load_status = 1 AND vf.load_status IN ('EMPTY','LOADED'))
          OR (vt.requires_load_status = 0 AND vf.load_status = 'NA'))
-      ORDER BY vt.active DESC, vt.name ASC, vt.id ASC, vf.load_status ASC
+      ORDER BY vt.category_review_required DESC, vt.active DESC, vc.sort_order, vt.name, vt.id, vf.load_status
     `);
     res.json({ success: true, data: mapTypes(rows) });
-  } catch (error) { next(error); }
+  } catch (error) {
+    const migrationError = migrationErrorIfNeeded(error);
+    if (migrationError) return next(migrationError);
+    next(error);
+  }
 });
 
 router.post('/', async (req, res, next) => {
@@ -105,19 +166,25 @@ router.post('/', async (req, res, next) => {
   try {
     const name = text(req.body.name);
     const code = codeFrom(req.body.code || name);
+    const categoryId = Number(req.body.vehicle_category_id);
     const requires = bool01(req.body.requires_load_status);
     const restricted = bool01(req.body.registration_restricted ?? req.body.restricted ?? 0);
     const active = bool01(req.body.active ?? 1);
 
-    if (!name) throw new AppError(400, 'VALIDATION_ERROR', 'El nombre del tipo de vehículo es obligatorio.');
+    if (!name) throw new AppError(400, 'VALIDATION_ERROR', 'El nombre comercial del tipo de vehículo es obligatorio.');
     if (!code) throw new AppError(400, 'VALIDATION_ERROR', 'El código del tipo de vehículo es obligatorio.');
+    if (!Number.isInteger(categoryId) || categoryId <= 0) throw new AppError(400, 'INVALID_VEHICLE_CATEGORY', 'La categoría real del vehículo es obligatoria.');
     if (await codeExists(code)) throw new AppError(409, 'CODE_EXISTS', 'Ya existe un tipo de vehículo con ese código.');
 
     await connection.beginTransaction();
+    await getCategory(connection, categoryId);
+
     const [result] = await connection.execute(
-      `INSERT INTO vehicle_types (code, name, requires_load_status, registration_restricted, active)
-       VALUES (?, ?, ?, ?, ?)`,
-      [code, name, requires, restricted, active]
+      `INSERT INTO vehicle_types (
+        vehicle_category_id, code, name, requires_load_status,
+        registration_restricted, category_review_required, active
+      ) VALUES (?, ?, ?, ?, ?, 0, ?)`,
+      [categoryId, code, name, requires, restricted, active]
     );
     const id = result.insertId;
 
@@ -129,7 +196,7 @@ router.post('/', async (req, res, next) => {
     }
 
     await connection.commit();
-    res.status(201).json({ success: true, message: 'Tipo de vehículo creado correctamente.', data: { id } });
+    res.status(201).json({ success: true, message: 'Tipo comercial creado y asociado a su categoría real.', data: { id } });
   } catch (error) {
     await connection.rollback();
     if (error?.code === 'ER_DUP_ENTRY') return next(new AppError(409, 'CODE_EXISTS', 'Ya existe un tipo de vehículo con ese código.'));
@@ -145,23 +212,47 @@ router.put('/:id', async (req, res, next) => {
   const connection = await pool.getConnection();
   try {
     const { id } = req.params;
-    const [current] = await connection.execute('SELECT * FROM vehicle_types WHERE id = ? LIMIT 1', [id]);
-    if (!current.length) throw new AppError(404, 'NOT_FOUND', 'Tipo de vehículo no encontrado.');
+    const [currentRows] = await connection.execute('SELECT * FROM vehicle_types WHERE id = ? LIMIT 1', [id]);
+    const current = currentRows[0];
+    if (!current) throw new AppError(404, 'NOT_FOUND', 'Tipo de vehículo no encontrado.');
 
     const name = text(req.body.name);
     const code = codeFrom(req.body.code || name);
+    const categoryId = Number(req.body.vehicle_category_id);
     const requires = bool01(req.body.requires_load_status);
-    const restricted = bool01(req.body.registration_restricted ?? req.body.restricted ?? current[0].registration_restricted);
-    const active = bool01(req.body.active ?? current[0].active);
+    const restricted = bool01(req.body.registration_restricted ?? req.body.restricted ?? current.registration_restricted);
+    const active = bool01(req.body.active ?? current.active);
 
-    if (!name) throw new AppError(400, 'VALIDATION_ERROR', 'El nombre del tipo de vehículo es obligatorio.');
+    if (!name) throw new AppError(400, 'VALIDATION_ERROR', 'El nombre comercial del tipo de vehículo es obligatorio.');
     if (!code) throw new AppError(400, 'VALIDATION_ERROR', 'El código del tipo de vehículo es obligatorio.');
+    if (!Number.isInteger(categoryId) || categoryId <= 0) throw new AppError(400, 'INVALID_VEHICLE_CATEGORY', 'La categoría real del vehículo es obligatoria.');
     if (await codeExists(code, id)) throw new AppError(409, 'CODE_EXISTS', 'Ya existe otro tipo de vehículo con ese código.');
 
     await connection.beginTransaction();
+    await getCategory(connection, categoryId);
+
+    if (Number(current.vehicle_category_id) !== categoryId) {
+      const [[usage]] = await connection.query(`
+        SELECT
+          (SELECT COUNT(*) FROM vehicles WHERE vehicle_type_id = ?) AS vehicles_count,
+          (SELECT COUNT(*) FROM operations WHERE vehicle_type_id = ?) AS operations_count,
+          (SELECT COUNT(*) FROM restricted_vehicle_registration_requests WHERE vehicle_type_id = ?) AS requests_count
+      `, [id, id, id]);
+      if (Number(usage.vehicles_count) > 0 || Number(usage.operations_count) > 0 || Number(usage.requests_count) > 0) {
+        throw new AppError(
+          409,
+          'VEHICLE_TYPE_CATEGORY_LOCKED',
+          'Esta opción ya fue utilizada. Para proteger el historial, crea una nueva opción con la categoría correcta y desactiva la anterior.'
+        );
+      }
+    }
+
     await connection.execute(
-      `UPDATE vehicle_types SET code = ?, name = ?, requires_load_status = ?, registration_restricted = ?, active = ? WHERE id = ?`,
-      [code, name, requires, restricted, active, id]
+      `UPDATE vehicle_types
+       SET vehicle_category_id = ?, code = ?, name = ?, requires_load_status = ?,
+           registration_restricted = ?, category_review_required = 0, active = ?
+       WHERE id = ?`,
+      [categoryId, code, name, requires, restricted, active, id]
     );
 
     if (requires) {
@@ -187,10 +278,28 @@ router.put('/:id', async (req, res, next) => {
 router.patch('/:id/active', async (req, res, next) => {
   try {
     const active = bool01(req.body.active);
+    if (active) {
+      const [rows] = await pool.execute(`
+        SELECT vt.id, vt.category_review_required, vc.active AS category_active
+        FROM vehicle_types vt
+        JOIN vehicle_categories vc ON vc.id = vt.vehicle_category_id
+        WHERE vt.id = ?
+        LIMIT 1
+      `, [req.params.id]);
+      const item = rows[0];
+      if (!item) throw new AppError(404, 'NOT_FOUND', 'Tipo de vehículo no encontrado.');
+      if (Number(item.category_review_required) === 1 || Number(item.category_active) !== 1) {
+        throw new AppError(409, 'CATEGORY_REVIEW_REQUIRED', 'Primero edita esta opción y asígnale una categoría real antes de activarla.');
+      }
+    }
     const [result] = await pool.execute('UPDATE vehicle_types SET active = ? WHERE id = ?', [active, req.params.id]);
     if (!result.affectedRows) throw new AppError(404, 'NOT_FOUND', 'Tipo de vehículo no encontrado.');
     res.json({ success: true, message: active ? 'Tipo de vehículo activado correctamente.' : 'Tipo de vehículo desactivado correctamente.' });
-  } catch (error) { next(error); }
+  } catch (error) {
+    const migrationError = migrationErrorIfNeeded(error);
+    if (migrationError) return next(migrationError);
+    next(error);
+  }
 });
 
 router.delete('/:id', async (req, res, next) => {
