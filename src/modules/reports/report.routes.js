@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { pool } from '../../db/pool.js';
 import { authRequired, allowRoles } from '../../middlewares/auth.js';
 import { fromColombiaDateRangeToUtc, todayColombiaRangeToUtc } from '../../utils/time.js';
-import { sendHtmlTableExport } from '../../utils/exporters.js';
+import { sendHtmlTableExport, sendStructuredReportExport } from '../../utils/exporters.js';
 import { centsToMoney, moneyToCents } from '../../utils/money.js';
 
 const router = Router();
@@ -1313,34 +1313,450 @@ function buildCompleteExportRows(report, { includeExpenses = true } = {}) {
   return rows;
 }
 
+
+function reportStatusText(status) {
+  return ({
+    OPEN: 'Abierta',
+    CLOSED: 'Cerrada',
+    PAID: 'Pagado',
+    EXEMPT: 'Tarifa 0',
+    BOARDED: 'Embarcado',
+    ANNULLED: 'Anulado',
+    REMOVED: 'Retirado'
+  })[status] || status || '';
+}
+
+function paymentMethodText(method) {
+  return ({ CASH: 'Efectivo', EXEMPT: 'Tarifa 0' })[method] || method || '';
+}
+
+function colombiaDateTime(value) {
+  if (!value) return '';
+  const raw = String(value).trim();
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)
+    ? raw
+    : `${raw.replace(' ', 'T')}Z`;
+  const date = value instanceof Date ? value : new Date(normalized);
+  if (Number.isNaN(date.getTime())) return raw;
+  return new Intl.DateTimeFormat('es-CO', {
+    timeZone: 'America/Bogota',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).format(date);
+}
+
+function buildCompleteStructuredReport(report, { includeExpenses = true } = {}) {
+  const { summary, filter } = report;
+  const selectedFerry = filter.ferry_id
+    ? [
+        ...(report.by_ferry || []),
+        ...(report.journeys || []),
+        ...(report.trips || []),
+        ...(report.expenses || [])
+      ].find(row => Number(row.ferry_id) === Number(filter.ferry_id))
+    : null;
+  const journeyLookup = new Map((report.journeys || []).map(row => [Number(row.journey_id || row.id), row]));
+
+  const moneyColumn = (header, key, width = 1) => ({ header, key, type: 'money', width, pdfWidth: width, excelWidth: Math.max(72, width * 12) });
+  const integerColumn = (header, key, width = 0.7) => ({ header, key, type: 'integer', width, pdfWidth: width, excelWidth: Math.max(54, width * 12) });
+  const textColumn = (header, key, width = 1, extra = {}) => ({ header, key, type: 'text', width, pdfWidth: width, excelWidth: Math.max(65, width * 12), ...extra });
+  const statusColumn = (header, key, width = 0.8) => ({ header, key, type: 'status', width, pdfWidth: width, excelWidth: Math.max(62, width * 12) });
+
+  const summaryCards = [
+    { label: 'Total jornadas', value: summary.journeys_total, type: 'integer' },
+    { label: 'Total trayectos', value: summary.trips_total, type: 'integer' },
+    { label: 'Total vehículos', value: summary.vehicles_total, type: 'integer' },
+    { label: 'Total facturado', value: summary.income_total, type: 'money' },
+    ...(includeExpenses ? [
+      { label: 'Total gastos', value: summary.expenses_total, type: 'money' },
+      { label: 'Resultado neto', value: summary.net_total, type: 'money' }
+    ] : []),
+    { label: 'Tarifa 0', value: summary.exempt_total, type: 'integer' },
+    { label: 'Embarcados', value: summary.boarded_total, type: 'integer' }
+  ];
+
+  const byFerryColumns = [
+    textColumn('Empresa', 'company_name', 1.35),
+    textColumn('Ferry', 'ferry_name', 1.1),
+    integerColumn('Jornadas', 'journeys_total', 0.62),
+    integerColumn('Trayectos', 'trips_total', 0.68),
+    integerColumn('Vehículos', 'vehicles_total', 0.68),
+    integerColumn('Tarifa 0', 'exempt_total', 0.62),
+    moneyColumn('Facturado', 'income_total', 0.9),
+    ...(includeExpenses ? [moneyColumn('Gastos', 'expenses_total', 0.85), moneyColumn('Neto', 'net_total', 0.85)] : [])
+  ];
+
+  const journeyRows = (report.by_journey || []).map(row => {
+    const source = journeyLookup.get(Number(row.journey_id)) || {};
+    return {
+      ...row,
+      journey_label: `#${row.journey_id}`,
+      journey_status_text: reportStatusText(row.journey_status),
+      opened_by_name: source.opened_by_name || '',
+      opened_at_local: colombiaDateTime(source.opened_at_utc),
+      closed_at_local: colombiaDateTime(source.closed_at_utc)
+    };
+  });
+
+  const journeyColumns = [
+    textColumn('Jornada', 'journey_label', 0.65),
+    textColumn('Fecha', 'journey_local_date', 0.8),
+    statusColumn('Estado', 'journey_status_text', 0.68),
+    textColumn('Ferry', 'ferry_name', 1),
+    textColumn('Abierta por', 'opened_by_name', 1),
+    textColumn('Apertura (Colombia)', 'opened_at_local', 1.15),
+    textColumn('Cierre (Colombia)', 'closed_at_local', 1.15),
+    integerColumn('Trayectos', 'trips_total', 0.65),
+    integerColumn('Vehículos', 'vehicles_total', 0.65),
+    integerColumn('Tarifa 0', 'exempt_total', 0.58),
+    moneyColumn('Facturado', 'income_total', 0.84),
+    ...(includeExpenses ? [
+      moneyColumn('Gastos sin trayecto', 'unassigned_expenses_total', 0.95),
+      moneyColumn('Gastos totales', 'expenses_total', 0.88),
+      moneyColumn('Neto', 'net_total', 0.82)
+    ] : [])
+  ];
+
+  const tripRows = (report.by_trip || []).map(row => ({
+    ...row,
+    journey_label: `#${row.journey_id}`,
+    trip_label: `#${row.trip_id}`,
+    trip_status_text: reportStatusText(row.trip_status),
+    opened_at_local: colombiaDateTime(row.trip_opened_at_utc),
+    closed_at_local: colombiaDateTime(row.trip_closed_at_utc),
+    responsible_text: [row.trip_opened_by_name && `Abrió: ${row.trip_opened_by_name}`, row.trip_closed_by_name && `Cerró: ${row.trip_closed_by_name}`].filter(Boolean).join(' / ')
+  }));
+
+  const tripColumns = [
+    textColumn('Jornada', 'journey_label', 0.55),
+    textColumn('Fecha', 'journey_local_date', 0.72),
+    textColumn('Trayecto', 'trip_label', 0.55),
+    textColumn('Ruta', 'route_name', 1.2),
+    statusColumn('Estado', 'trip_status_text', 0.65),
+    textColumn('Ferry', 'ferry_name', 0.9),
+    textColumn('Apertura', 'opened_at_local', 0.95),
+    textColumn('Cierre', 'closed_at_local', 0.95),
+    textColumn('Responsables', 'responsible_text', 1.35, { maxLines: 3 }),
+    integerColumn('Vehículos', 'vehicles_total', 0.6),
+    integerColumn('Tarifa 0', 'exempt_total', 0.55),
+    moneyColumn('Facturado', 'income_total', 0.78),
+    ...(includeExpenses ? [moneyColumn('Gastos', 'expenses_total', 0.72), moneyColumn('Neto', 'net_total', 0.72)] : []),
+    textColumn('Detalle por tipo', 'type_summary_text', 2.1, { maxLines: 4 })
+  ];
+
+  const userColumns = [
+    textColumn('Operador / cobrador', 'user_name', 1.4),
+    textColumn('Rol', 'user_role', 0.8),
+    integerColumn('Vehículos facturados', 'vehicles_total', 0.9),
+    integerColumn('Tarifa 0', 'exempt_total', 0.7),
+    moneyColumn('Total facturado', 'income_total', 1)
+  ];
+
+  const userTripRows = (report.by_user_trip || []).map(row => ({
+    ...row,
+    journey_label: `#${row.journey_id}`,
+    trip_label: `#${row.trip_id}`
+  }));
+  const userTripColumns = [
+    textColumn('Fecha', 'journey_local_date', 0.72),
+    textColumn('Jornada', 'journey_label', 0.55),
+    textColumn('Trayecto', 'trip_label', 0.55),
+    textColumn('Ruta', 'route_name', 1.15),
+    textColumn('Ferry', 'ferry_name', 0.9),
+    textColumn('Operador', 'user_name', 1.15),
+    textColumn('Rol', 'user_role', 0.72),
+    integerColumn('Vehículos operador', 'vehicles_total', 0.78),
+    moneyColumn('Facturado operador', 'income_total', 0.9),
+    integerColumn('Vehículos trayecto', 'trip_vehicles_total', 0.78),
+    moneyColumn('Total trayecto', 'trip_income_total', 0.85),
+    textColumn('Tipos facturados por operador', 'type_summary_text', 2, { maxLines: 4 })
+  ];
+
+  const categoryColumns = [
+    textColumn('Categoría principal', 'vehicle_category_name', 1.5),
+    integerColumn('Cantidad', 'qty', 0.7),
+    integerColumn('Tarifa 0', 'exempt_total', 0.7),
+    moneyColumn('Total facturado', 'total', 1)
+  ];
+
+  const typeRows = (report.by_vehicle_type || []).map(row => ({
+    ...row,
+    load_status_text: condicionTexto(row.load_status)
+  }));
+  const typeColumns = [
+    textColumn('Categoría principal', 'vehicle_category_name', 1.25),
+    textColumn('Tipo personalizado', 'vehicle_type_name', 1.45),
+    textColumn('Condición', 'load_status_text', 0.9),
+    integerColumn('Cantidad', 'qty', 0.65),
+    integerColumn('Tarifa 0', 'exempt_total', 0.65),
+    moneyColumn('Total facturado', 'total', 1)
+  ];
+
+  const expenseSummaryColumns = [
+    textColumn('Ferry', 'ferry_name', 1.2),
+    textColumn('Categoría', 'category_name', 1.35),
+    integerColumn('Movimientos', 'qty', 0.8),
+    moneyColumn('Total gastos', 'total', 1)
+  ];
+  const expenseRows = (report.expenses || []).map(row => ({
+    ...row,
+    expense_label: `#${row.id}`,
+    category_name: expenseCategoryText(row.category),
+    association_text: row.trip_id
+      ? `Jornada #${row.journey_id} / Trayecto #${row.trip_id} / ${row.route_name || ''}`
+      : row.journey_id
+        ? `Jornada #${row.journey_id} / Sin trayecto`
+        : 'Gasto general',
+    expense_at_local: colombiaDateTime(row.expense_at_utc)
+  }));
+  const expenseColumns = [
+    textColumn('ID', 'expense_label', 0.55),
+    textColumn('Fecha (Colombia)', 'expense_at_local', 1),
+    textColumn('Ferry', 'ferry_name', 0.9),
+    textColumn('Categoría', 'category_name', 1),
+    textColumn('Descripción', 'description', 2, { maxLines: 4 }),
+    textColumn('Asociación', 'association_text', 1.7, { maxLines: 3 }),
+    moneyColumn('Valor', 'amount', 0.82),
+    textColumn('Registrado por', 'created_by_name', 1.1)
+  ];
+
+  const operationRows = (report.operations || []).map(row => ({
+    ...row,
+    created_at_local: colombiaDateTime(row.created_at_utc),
+    journey_label: `#${row.journey_id}`,
+    trip_label: `#${row.trip_id}`,
+    ticket_label: row.ticket_number || row.invoice_number || '',
+    vehicle_text: `${row.vehicle_category_name || 'Sin categoría'} / ${row.vehicle_type_name}`,
+    load_status_text: condicionTexto(row.load_status),
+    operation_status_text: estadoOperacionTexto(row.status),
+    payment_method_text: paymentMethodText(row.payment_method),
+    income_value: centsToMoney(operationIncomeCents(row)),
+    route_ferry_text: `${row.ferry_name} / ${row.route_name}`,
+    billed_boarded_text: [row.billed_by_name && `Facturó: ${row.billed_by_name}`, row.boarding_by_name && `Embarcó: ${row.boarding_by_name}`].filter(Boolean).join(' / ')
+  }));
+  const operationColumns = [
+    textColumn('Fecha (Colombia)', 'created_at_local', 0.9),
+    textColumn('Jornada', 'journey_label', 0.5),
+    textColumn('Trayecto', 'trip_label', 0.5),
+    textColumn('Ticket', 'ticket_label', 0.9),
+    textColumn('Placa', 'normalized_plate', 0.7),
+    textColumn('Ferry / ruta', 'route_ferry_text', 1.35, { maxLines: 3 }),
+    textColumn('Categoría / tipo', 'vehicle_text', 1.5, { maxLines: 3 }),
+    textColumn('Condición', 'load_status_text', 0.72),
+    textColumn('Estado', 'operation_status_text', 0.72),
+    textColumn('Pago', 'payment_method_text', 0.7),
+    moneyColumn('Valor', 'income_value', 0.78),
+    textColumn('Registró', 'registered_by_name', 1),
+    textColumn('Facturó / embarcó', 'billed_boarded_text', 1.4, { maxLines: 3 })
+  ];
+
+  const validationRows = (report.integrity?.checks || []).map(check => ({
+    status: check.ok ? 'CORRECTO' : 'REVISAR',
+    name: check.name,
+    actual: check.actual,
+    expected: check.expected,
+    difference: Number(check.actual || 0) - Number(check.expected || 0)
+  }));
+  const validationColumns = [
+    statusColumn('Estado', 'status', 0.8),
+    textColumn('Validación', 'name', 2.4),
+    textColumn('Calculado', 'actual', 1),
+    textColumn('Esperado', 'expected', 1),
+    textColumn('Diferencia', 'difference', 0.9)
+  ];
+
+  const sheets = [
+    {
+      name: 'Resumen',
+      title: 'Resumen general',
+      tables: [{
+        title: 'Consolidado por ferry',
+        note: 'Esta tabla muestra jornadas, trayectos, vehículos e importes consolidados por cada ferry para el filtro seleccionado.',
+        columns: byFerryColumns,
+        rows: report.by_ferry || [],
+        totals: {
+          company_name: 'TOTAL GENERAL',
+          journeys_total: summary.journeys_total,
+          trips_total: summary.trips_total,
+          vehicles_total: summary.vehicles_total,
+          exempt_total: summary.exempt_total,
+          income_total: summary.income_total,
+          ...(includeExpenses ? { expenses_total: summary.expenses_total, net_total: summary.net_total } : {})
+        }
+      }]
+    },
+    {
+      name: 'Jornadas',
+      title: 'Jornadas totales',
+      pageBreakBefore: true,
+      tables: [{
+        title: 'Jornadas totales y detalle financiero',
+        note: 'Una fila corresponde a una jornada. Incluye incluso jornadas sin vehículos, para que el total de jornadas sea real.',
+        columns: journeyColumns,
+        rows: journeyRows,
+        totals: {
+          journey_label: 'TOTAL',
+          trips_total: summary.trips_total,
+          vehicles_total: summary.vehicles_total,
+          exempt_total: summary.exempt_total,
+          income_total: summary.income_total,
+          ...(includeExpenses ? { expenses_total: summary.expenses_total, net_total: summary.net_total } : {})
+        },
+        pageBreakBefore: true,
+        fontSize: 5.3,
+        maxLines: 3
+      }]
+    },
+    {
+      name: 'Trayectos',
+      title: 'Detalle de trayectos',
+      pageBreakBefore: true,
+      tables: [{
+        title: 'Trayectos pertenecientes a las jornadas',
+        note: 'Detalle de cada trayecto con responsables, vehículos, tipos facturados, ingresos y gastos.',
+        columns: tripColumns,
+        rows: tripRows,
+        totals: {
+          journey_label: 'TOTAL',
+          vehicles_total: summary.vehicles_total,
+          exempt_total: summary.exempt_total,
+          income_total: summary.income_total,
+          ...(includeExpenses ? { expenses_total: summary.trip_expenses_total, net_total: summary.income_total - summary.trip_expenses_total } : {})
+        },
+        pageBreakBefore: true,
+        fontSize: 5.1,
+        maxLines: 3
+      }]
+    },
+    {
+      name: 'Operadores',
+      title: 'Facturación por operador',
+      pageBreakBefore: true,
+      tables: [
+        {
+          title: 'Total facturado por operador o cobrador',
+          columns: userColumns,
+          rows: report.by_user || [],
+          totals: { user_name: 'TOTAL', vehicles_total: summary.vehicles_total, exempt_total: summary.exempt_total, income_total: summary.income_total }
+        },
+        {
+          title: 'Detalle del operador por trayecto',
+          note: 'Permite identificar cuánto facturó cada usuario dentro de cada trayecto y compararlo con el total completo de ese trayecto.',
+          columns: userTripColumns,
+          rows: userTripRows,
+          totals: { journey_local_date: 'TOTAL', vehicles_total: summary.vehicles_total, income_total: summary.income_total },
+          pageBreakBefore: true,
+          fontSize: 5.4,
+          maxLines: 3
+        }
+      ]
+    },
+    {
+      name: 'Vehículos',
+      title: 'Vehículos y tipos personalizados',
+      pageBreakBefore: true,
+      tables: [
+        {
+          title: 'Total por categoría principal',
+          columns: categoryColumns,
+          rows: report.by_vehicle_category || [],
+          totals: { vehicle_category_name: 'TOTAL', qty: summary.vehicles_total, exempt_total: summary.exempt_total, total: summary.income_total }
+        },
+        {
+          title: 'Total por tipo personalizado de vehículo',
+          note: 'Ejemplo: Moto JACUR, Moto Solano, Taxi y demás tipos configurados, separados también por condición cargado o descargado.',
+          columns: typeColumns,
+          rows: typeRows,
+          totals: { vehicle_category_name: 'TOTAL', qty: summary.vehicles_total, exempt_total: summary.exempt_total, total: summary.income_total }
+        }
+      ]
+    },
+    ...(includeExpenses ? [{
+      name: 'Gastos',
+      title: 'Gastos del periodo',
+      pageBreakBefore: true,
+      tables: [
+        {
+          title: 'Resumen de gastos por categoría y ferry',
+          columns: expenseSummaryColumns,
+          rows: report.by_expense_category || [],
+          totals: { ferry_name: 'TOTAL', qty: summary.expenses_count, total: summary.expenses_total }
+        },
+        {
+          title: 'Detalle completo de gastos',
+          note: 'Indica si el gasto pertenece a un trayecto, a una jornada sin trayecto o si es un gasto general.',
+          columns: expenseColumns,
+          rows: expenseRows,
+          totals: { expense_label: 'TOTAL', amount: summary.expenses_total },
+          pageBreakBefore: true,
+          fontSize: 5.8,
+          maxLines: 4
+        }
+      ]
+    }] : []),
+    {
+      name: 'Tickets',
+      title: 'Detalle de tickets y vehículos',
+      pageBreakBefore: true,
+      tables: [{
+        title: 'Movimientos facturados del periodo',
+        note: 'Solo incluye operaciones activas: no contiene vehículos anulados, retirados ni registros desactivados del trayecto.',
+        columns: operationColumns,
+        rows: operationRows,
+        totals: { created_at_local: 'TOTAL', income_value: summary.income_total },
+        pageBreakBefore: true,
+        fontSize: 5.15,
+        maxLines: 3
+      }]
+    },
+    {
+      name: 'Validaciones',
+      title: 'Validación de totales',
+      pageBreakBefore: true,
+      tables: [{
+        title: report.integrity?.ok ? 'Totales verificados correctamente' : 'Existen totales que requieren revisión',
+        note: `Validación ejecutada: ${colombiaDateTime(report.integrity?.checked_at_utc)}. Cada control compara el total general con sus agrupaciones.`,
+        columns: validationColumns,
+        rows: validationRows,
+        pageBreakBefore: true
+      }]
+    }
+  ];
+
+  return {
+    title: 'Reporte administrativo completo - Transdier V2',
+    subtitle: 'Información organizada por tablas y columnas. Todos los datos respetan el rango de fechas y el ferry seleccionados.',
+    metadata: [
+      { label: 'Periodo', value: `${filter.from} a ${filter.to}` },
+      { label: 'Ferry', value: selectedFerry?.ferry_name || (filter.ferry_id ? `Ferry #${filter.ferry_id}` : 'Todos los ferris') },
+      { label: 'Estado de cifras', value: report.integrity?.ok ? 'Totales verificados' : 'Totales por revisar' },
+      { label: 'Generado', value: colombiaDateTime(new Date().toISOString()) }
+    ],
+    summary: summaryCards,
+    sheets
+  };
+}
+
 router.get('/complete/export', allowRoles('ADMIN', 'SECRETARIA', 'SOCIO'), async (req, res, next) => {
   try {
     const sourceReport = await buildFinancialReport(req.query);
     const report = sanitizeReportForRole(sourceReport, req.user.role);
     const includeExpenses = req.user.role !== 'SOCIO';
-    const rows = buildCompleteExportRows(report, { includeExpenses });
     const { filter } = report;
+    const structured = buildCompleteStructuredReport(report, { includeExpenses });
 
-    sendHtmlTableExport(res, {
-      filename: `transdier-reporte-completo-${filter.from}-${filter.to}`,
+    sendStructuredReportExport(res, {
+      filename: `transdier-reporte-completo-tablas-${filter.from}-${filter.to}`,
       format: req.query.format === 'pdf' ? 'pdf' : 'excel',
-      title: `Reporte completo Transdier ${filter.from} a ${filter.to}`,
-      rows,
-      columns: [
-        { header: 'Sección', key: 'section' },
-        { header: 'Grupo', key: 'group' },
-        { header: 'Concepto', key: 'concept' },
-        { header: 'Detalle', key: 'detail' },
-        { header: 'Cantidad', key: 'quantity' },
-        { header: 'Ingresos', key: 'income' },
-        { header: 'Gastos', key: 'expenses' },
-        { header: 'Neto', key: 'net' },
-        { header: 'Responsable', key: 'responsible' },
-        { header: 'Fecha / hora UTC', key: 'date' }
-      ]
+      ...structured
     });
   } catch (error) { next(error); }
 });
+
 
 
 function buildConsolidatedExportRows(report, isSocio) {
