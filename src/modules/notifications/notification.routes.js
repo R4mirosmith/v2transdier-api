@@ -143,11 +143,11 @@ router.post('/read-all', allowRoles('ADMIN'), async (req, res, next) => {
   } catch (error) { next(migrationErrorIfNeeded(error) || error); }
 });
 
-router.get('/push/config', allowRoles('ADMIN'), (_req, res) => {
+router.get('/push/config', allowRoles('ADMIN', 'CASHIER', 'OPERATOR'), (_req, res) => {
   res.json({ success: true, data: getPushPublicConfig() });
 });
 
-router.post('/push/subscribe', allowRoles('ADMIN'), async (req, res, next) => {
+router.post('/push/subscribe', allowRoles('ADMIN', 'CASHIER', 'OPERATOR'), async (req, res, next) => {
   try {
     const config = getPushPublicConfig();
     if (!config.enabled) {
@@ -175,7 +175,7 @@ router.post('/push/subscribe', allowRoles('ADMIN'), async (req, res, next) => {
   }
 });
 
-router.post('/push/unsubscribe', allowRoles('ADMIN'), async (req, res, next) => {
+router.post('/push/unsubscribe', allowRoles('ADMIN', 'CASHIER', 'OPERATOR'), async (req, res, next) => {
   try {
     const endpoint = String(req.body?.endpoint || '').trim();
     if (!endpoint) throw new AppError(400, 'VALIDATION_ERROR', 'El endpoint de la suscripción es obligatorio.');
@@ -193,7 +193,7 @@ router.post('/push/unsubscribe', allowRoles('ADMIN'), async (req, res, next) => 
   }
 });
 
-router.post('/push/test', allowRoles('ADMIN'), async (req, res, next) => {
+router.post('/push/test', allowRoles('ADMIN', 'CASHIER', 'OPERATOR'), async (req, res, next) => {
   try {
     const notification = {
       id: `test-${Date.now()}`,
@@ -202,7 +202,7 @@ router.post('/push/test', allowRoles('ADMIN'), async (req, res, next) => {
       title: 'Prueba de alertas Transdier',
       message: 'Las notificaciones de este dispositivo están funcionando correctamente.',
       user_id: req.user.id,
-      payload: { test: true }
+      payload: { test: true, url: req.user.role === 'ADMIN' ? '/notificaciones' : '/tickets' }
     };
     const result = await sendPushNotification(notification, { force: true });
     if (!result.enabled) {

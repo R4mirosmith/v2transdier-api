@@ -100,12 +100,15 @@ function pushPayload(notification, badgeCount = 0) {
     badge: '/icons/badge-96.png',
     tag: notification.type === 'vehicle:restriction_requested'
       ? `restriction-request-${payload.restriction_request_id || notification.id}`
-      : `transdier-notification-${notification.id}`,
-    renotify: true,
-    requireInteraction: notification.type === 'vehicle:restriction_requested',
+      : notification.type === 'vehicle:restriction_approved'
+        ? `restriction-approved-${payload.restriction_request_id || notification.id}`
+        : `transdier-notification-${notification.id}`,
+    renotify: false,
+    requireInteraction: notification.type === 'vehicle:restriction_requested'
+      || notification.type === 'vehicle:restriction_approved',
     vibrate: [250, 120, 250, 120, 400],
     data: {
-      url: '/notificaciones',
+      url: payload.url || (notification.type === 'vehicle:restriction_approved' ? '/tickets' : '/notificaciones'),
       notification_id: notification.id,
       type: notification.type,
       payload
@@ -124,11 +127,9 @@ function shouldSendPush(notification, force) {
 
 async function unreadCountFor(notification, recipientUserId) {
   if (notification.user_id) {
-    const [rows] = await pool.execute(
-      'SELECT COUNT(*) AS total FROM notifications WHERE user_id = ? AND read_at_utc IS NULL',
-      [recipientUserId]
-    );
-    return Number(rows[0]?.total || 0);
+    // Cobradores y operadores no tienen bandeja de notificaciones: se muestra
+    // un solo indicador y la app lo limpia al volver al primer plano.
+    return 1;
   }
 
   const [rows] = await pool.execute(`
