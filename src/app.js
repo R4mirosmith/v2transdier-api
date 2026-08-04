@@ -25,7 +25,17 @@ const __dirname = path.dirname(__filename);
 
 export function createApp() {
   const app = express();
-  app.use(cors({ origin: env.frontendOrigin, credentials: true }));
+  const allowedOrigins = String(env.frontendOrigin || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  app.use(cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error('CORS_ORIGIN_NOT_ALLOWED'));
+    },
+    credentials: true
+  }));
   app.use(express.json({ limit: '2mb' }));
   app.use(express.urlencoded({ extended: true }));
 

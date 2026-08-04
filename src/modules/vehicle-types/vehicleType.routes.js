@@ -1,6 +1,8 @@
 import { Router } from 'express';
+import path from 'path';
 import { pool } from '../../db/pool.js';
 import { authRequired, allowRoles } from '../../middlewares/auth.js';
+import { upload, setUploadFolder } from '../../middlewares/upload.js';
 import { AppError } from '../../utils/errors.js';
 
 const router = Router();
@@ -24,8 +26,20 @@ function bool01(value) {
   return value === true || value === 1 || value === '1' || value === 'true' ? 1 : 0;
 }
 
+function categoryImagePath(file) {
+  if (!file) return null;
+  return `/uploads/vehicle-categories/${path.basename(file.path)}`;
+}
+
 function migrationErrorIfNeeded(error) {
   const message = String(error?.message || '');
+  if (error?.code === 'ER_BAD_FIELD_ERROR' && message.includes('image_path')) {
+    return new AppError(
+      400,
+      'VEHICLE_CATEGORY_IMAGES_NEED_MIGRATION',
+      'Falta habilitar imágenes para las categorías. Ejecuta database/migration_imagenes_categorias_vehiculos.sql.'
+    );
+  }
   if (
     error?.code === 'ER_NO_SUCH_TABLE' && message.includes('vehicle_categories')
     || error?.code === 'ER_BAD_FIELD_ERROR' && (
@@ -93,6 +107,7 @@ function mapTypes(rows) {
         vehicle_category_code: row.vehicle_category_code,
         vehicle_category_name: row.vehicle_category_name,
         plate_category: row.plate_category,
+        vehicle_category_image_path: row.vehicle_category_image_path || null,
         code: row.code,
         name: row.name,
         requires_load_status: !!row.requires_load_status,
@@ -120,12 +135,37 @@ function mapTypes(rows) {
 router.get('/categories', async (_req, res, next) => {
   try {
     const [rows] = await pool.execute(`
-      SELECT id, code, name, plate_category, active, sort_order
+      SELECT id, code, name, plate_category, active, sort_order, image_path
       FROM vehicle_categories
       WHERE active = 1
       ORDER BY sort_order, name
     `);
     res.json({ success: true, data: rows.map((row) => ({ ...row, active: !!row.active })) });
+  } catch (error) {
+    const migrationError = migrationErrorIfNeeded(error);
+    if (migrationError) return next(migrationError);
+    next(error);
+  }
+});
+
+router.post('/categories/:id/image', setUploadFolder('vehicle-categories'), upload.single('image'), async (req, res, next) => {
+  try {
+    if (!req.file) throw new AppError(400, 'CATEGORY_IMAGE_REQUIRED', 'Selecciona una imagen para la categoría.');
+    const categoryId = Number(req.params.id);
+    if (!categoryId) throw new AppError(400, 'INVALID_VEHICLE_CATEGORY', 'Categoría inválida.');
+
+    const imagePath = categoryImagePath(req.file);
+    const [result] = await pool.execute(
+      'UPDATE vehicle_categories SET image_path = ? WHERE id = ? AND active = 1',
+      [imagePath, categoryId]
+    );
+    if (!result.affectedRows) throw new AppError(404, 'NOT_FOUND', 'Categoría de vehículo no encontrada.');
+
+    res.json({
+      success: true,
+      message: 'Imagen de la categoría actualizada.',
+      data: { id: categoryId, image_path: imagePath }
+    });
   } catch (error) {
     const migrationError = migrationErrorIfNeeded(error);
     if (migrationError) return next(migrationError);
@@ -141,6 +181,7 @@ router.get('/', async (_req, res, next) => {
         vc.code AS vehicle_category_code,
         vc.name AS vehicle_category_name,
         vc.plate_category,
+        vc.image_path AS vehicle_category_image_path,
         vf.load_status,
         vf.price,
         vf.active AS fare_active

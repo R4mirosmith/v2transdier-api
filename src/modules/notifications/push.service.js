@@ -115,8 +115,11 @@ function pushPayload(notification, badgeCount = 0) {
 
 function shouldSendPush(notification, force) {
   if (force) return true;
-  return notification?.type === 'vehicle:restriction_requested'
-    || notification?.severity === 'DANGER';
+  const type = String(notification?.type || '');
+  const severity = String(notification?.severity || '').toUpperCase();
+  return type === 'vehicle:restriction_requested'
+    || type === 'vehicle:restriction_approved'
+    || severity === 'DANGER';
 }
 
 async function unreadCountFor(notification, recipientUserId) {
@@ -206,7 +209,7 @@ export async function sendPushNotification(notification, { force = false } = {})
     try {
       const badgeCount = await unreadCountFor(notification, row.user_id);
       const payload = pushPayload(notification, badgeCount);
-      await webpush.sendNotification(subscription, payload, { TTL: 300, urgency: 'high' });
+      await webpush.sendNotification(subscription, payload, { TTL: 120, urgency: 'high', timeout: 10000 });
       sent += 1;
       await recordSuccess(row.id);
     } catch (error) {

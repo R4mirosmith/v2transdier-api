@@ -92,6 +92,41 @@ router.get('/unread-count', allowRoles('ADMIN'), async (req, res, next) => {
   } catch (error) { next(migrationErrorIfNeeded(error) || error); }
 });
 
+router.get('/pending', allowRoles('ADMIN'), async (_req, res, next) => {
+  try {
+    const [[rows], [countRows]] = await Promise.all([
+      pool.execute(`
+        SELECT
+          n.*,
+          NULL AS user_read_at_utc,
+          rr.id AS restriction_request_id,
+          rr.status AS restriction_request_status,
+          rr.resolved_at_utc AS restriction_request_resolved_at_utc,
+          resolver.name AS restriction_request_resolved_by_name
+        FROM restricted_vehicle_registration_requests rr
+        JOIN notifications n ON n.id = rr.notification_id
+        LEFT JOIN users resolver ON resolver.id = rr.resolved_by_user_id
+        WHERE rr.status = 'PENDING'
+        ORDER BY n.id DESC
+        LIMIT 50
+      `),
+      pool.execute(`
+        SELECT COUNT(*) AS total
+        FROM restricted_vehicle_registration_requests
+        WHERE status = 'PENDING'
+      `)
+    ]);
+    const notifications = rows.map(mapNotification);
+    res.json({
+      success: true,
+      data: {
+        count: Number(countRows[0]?.total || 0),
+        notifications
+      }
+    });
+  } catch (error) { next(migrationErrorIfNeeded(error) || error); }
+});
+
 router.post('/read-all', allowRoles('ADMIN'), async (req, res, next) => {
   try {
     const [result] = await pool.execute(`

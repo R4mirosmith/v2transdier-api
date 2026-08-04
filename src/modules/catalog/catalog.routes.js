@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { pool } from '../../db/pool.js';
 import { authRequired } from '../../middlewares/auth.js';
+import { AppError } from '../../utils/errors.js';
 
 const router = Router();
 router.use(authRequired);
@@ -44,6 +45,7 @@ router.get('/vehicle-types', async (_req, res, next) => {
         vc.code AS vehicle_category_code,
         vc.name AS vehicle_category_name,
         vc.plate_category,
+        vc.image_path AS vehicle_category_image_path,
         vf.load_status,
         vf.price
       FROM vehicle_types vt
@@ -67,6 +69,7 @@ router.get('/vehicle-types', async (_req, res, next) => {
           vehicle_category_code: row.vehicle_category_code,
           vehicle_category_name: row.vehicle_category_name,
           plate_category: row.plate_category,
+          vehicle_category_image_path: row.vehicle_category_image_path || null,
           code: row.code,
           name: row.name,
           requires_load_status: !!row.requires_load_status,
@@ -77,7 +80,16 @@ router.get('/vehicle-types', async (_req, res, next) => {
       if (row.load_status) map.get(row.id).fares.push({ load_status: row.load_status, price: row.price });
     }
     res.json({ success: true, data: Array.from(map.values()) });
-  } catch (error) { next(error); }
+  } catch (error) {
+    if (error?.code === 'ER_BAD_FIELD_ERROR' && String(error.message || '').includes('image_path')) {
+      return next(new AppError(
+        400,
+        'VEHICLE_CATEGORY_IMAGES_NEED_MIGRATION',
+        'Falta habilitar imágenes para las categorías. Ejecuta database/migration_imagenes_categorias_vehiculos.sql.'
+      ));
+    }
+    next(error);
+  }
 });
 
 export default router;

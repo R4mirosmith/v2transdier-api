@@ -5,7 +5,7 @@ import { authRequired, allowRoles } from '../../middlewares/auth.js';
 import { upload, setUploadFolder } from '../../middlewares/upload.js';
 import { AppError } from '../../utils/errors.js';
 import { createNotification, publishNotification } from '../notifications/notification.service.js';
-import { emitToAdmins } from '../../sockets/index.js';
+import { emitToOperations } from '../../sockets/index.js';
 import { sendHtmlTableExport } from '../../utils/exporters.js';
 
 const router = Router();
@@ -330,7 +330,7 @@ router.post('/open', allowRoles('ADMIN','CASHIER','OPERATOR'), async (req, res, 
       return rows[0];
     });
     publishNotification(notification);
-    emitToAdmins('trip:opened', result);
+    emitToOperations('trip:opened', { id: result.id, status: result.status });
     res.status(201).json({ success: true, data: result });
   } catch (error) { next(error); }
 });
@@ -357,7 +357,7 @@ router.post('/:id/close', allowRoles('ADMIN','CASHIER','OPERATOR'), setUploadFol
       return { id: Number(req.params.id), status: 'CLOSED', closure_photo_path: photoPath };
     });
     publishNotification(notification);
-    emitToAdmins('trip:closed', result);
+    emitToOperations('trip:closed', { id: result.id, status: result.status });
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 });
@@ -399,7 +399,7 @@ router.post('/:id/deactivate', allowRoles('ADMIN'), async (req, res, next) => {
       return { id: Number(req.params.id), status: 'CANCELLED', operations_excluded: true };
     });
     publishNotification(notification);
-    emitToAdmins('trip:deactivated', result);
+    emitToOperations('trip:deactivated', { id: result.id, status: result.status });
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 });

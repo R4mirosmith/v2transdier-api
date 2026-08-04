@@ -381,14 +381,23 @@ router.get('/trip/:tripId/summary', async (req, res, next) => {
       FROM operations o WHERE o.trip_id = ? AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED') AND EXISTS (SELECT 1 FROM trips tx WHERE tx.id = o.trip_id AND tx.deleted_at_utc IS NULL)
     `, [req.params.tripId]);
     const [byType] = await pool.execute(`
-      SELECT vt.name, o.vehicle_category_id,
-        vc.name AS vehicle_category_name, vc.code AS vehicle_category_code,
-        COUNT(*) AS qty, SUM(o.fare_price) AS total
+      SELECT
+        o.vehicle_type_id,
+        vt.name AS vehicle_type_name,
+        o.vehicle_category_id,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
+        COUNT(*) AS qty,
+        COALESCE(SUM(o.fare_price), 0) AS total
       FROM operations o
       JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
       JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
-      WHERE o.trip_id = ? AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED') AND EXISTS (SELECT 1 FROM trips tx WHERE tx.id = o.trip_id AND tx.deleted_at_utc IS NULL)
-      GROUP BY vt.name, o.vehicle_category_id, vc.name, vc.code ORDER BY vc.name, vt.name
+      WHERE o.trip_id = ?
+        AND o.active_in_trip = 1
+        AND o.status NOT IN ('ANNULLED','REMOVED')
+        AND EXISTS (SELECT 1 FROM trips tx WHERE tx.id = o.trip_id AND tx.deleted_at_utc IS NULL)
+      GROUP BY o.vehicle_type_id, vt.name, o.vehicle_category_id, vc.name, vc.code
+      ORDER BY vc.name, vt.name
     `, [req.params.tripId]);
     res.json({ success: true, data: { summary: summary[0], by_type: byType } });
   } catch (error) { next(error); }

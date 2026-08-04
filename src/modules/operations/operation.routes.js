@@ -7,7 +7,7 @@ import { upload, setUploadFolder } from '../../middlewares/upload.js';
 import { AppError } from '../../utils/errors.js';
 import { normalizePlate, validatePlate, validatePlateMatchesVehicleType } from '../../utils/plates.js';
 import { createNotification, publishNotification } from '../notifications/notification.service.js';
-import { emitToAdmins } from '../../sockets/index.js';
+import { emitToAdmins, emitToOperations } from '../../sockets/index.js';
 
 const router = Router();
 router.use(authRequired);
@@ -472,7 +472,7 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
     }
 
     publishNotification(pendingNotification);
-    emitToAdmins('operation:registered', result);
+    emitToOperations('operation:registered', { id: result.id, trip_id: result.trip_id });
     res.status(201).json({ success: true, data: result });
   } catch (error) {
     const migrationError = restrictionMigrationError(error);
@@ -524,7 +524,7 @@ router.post('/:id/board', allowRoles('OPERATOR','CASHIER','ADMIN'), setUploadFol
       return updated[0];
     });
     publishNotification(notification);
-    emitToAdmins('operation:boarded', result);
+    emitToOperations('operation:boarded', { id: result.id, trip_id: result.trip_id });
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 });
@@ -547,9 +547,10 @@ router.post('/:id/remove-from-trip', allowRoles('ADMIN'), async (req, res, next)
         message: `${req.user.name} retiró ${op.normalized_plate} del trayecto sin borrar el ticket histórico.`,
         payload: { operation_id: op.id, reason }
       });
-      return { id: op.id, active_in_trip: 0 };
+      return { id: op.id, trip_id: op.trip_id, active_in_trip: 0 };
     });
     publishNotification(notification);
+    emitToOperations('operation:removed', { id: result.id, trip_id: result.trip_id });
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 });
@@ -575,10 +576,10 @@ router.post('/:id/cancel', allowRoles('ADMIN'), async (req, res, next) => {
         message: `${req.user.name} anuló ${op.ticket_number || op.invoice_number} - ${op.normalized_plate}. Motivo: ${reason}`,
         payload: { operation_id: op.id, ticket_number: op.ticket_number || op.invoice_number, reason }
       });
-      return { id: op.id, status: 'ANNULLED' };
+      return { id: op.id, trip_id: op.trip_id, status: 'ANNULLED' };
     });
     publishNotification(notification);
-    emitToAdmins('operation:cancelled', result);
+    emitToOperations('operation:cancelled', { id: result.id, trip_id: result.trip_id });
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 });
