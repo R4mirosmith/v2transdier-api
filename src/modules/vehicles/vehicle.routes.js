@@ -88,6 +88,96 @@ router.get('/', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+router.post('/', async (req, res, next) => {
+  let notification;
+  try {
+    const result = await withTransaction(async (conn) => {
+      const plateCheck = validatePlate(req.body.display_plate || req.body.normalized_plate);
+      if (!plateCheck.ok) throw new AppError(400, 'INVALID_PLATE', plateCheck.message);
+
+      const normalizedPlate = plateCheck.normalized;
+      const displayPlate = text(req.body.display_plate || normalizedPlate).toUpperCase();
+      const vehicleTypeId = Number(req.body.vehicle_type_id);
+      const active = bool01(req.body.active ?? 1);
+
+      if (!Number.isInteger(vehicleTypeId) || vehicleTypeId <= 0) {
+        throw new AppError(400, 'INVALID_VEHICLE_TYPE', 'Selecciona un tipo de vehículo válido.');
+      }
+
+      const [typeRows] = await conn.execute(`
+        SELECT
+          vt.*,
+          vc.name AS vehicle_category_name,
+          vc.code AS vehicle_category_code,
+          vc.plate_category
+        FROM vehicle_types vt
+        JOIN vehicle_categories vc ON vc.id = vt.vehicle_category_id
+        WHERE vt.id = ?
+          AND vt.active = 1
+          AND vc.active = 1
+          AND vt.category_review_required = 0
+        LIMIT 1
+      `, [vehicleTypeId]);
+      const vehicleType = typeRows[0];
+      if (!vehicleType) {
+        throw new AppError(400, 'INVALID_VEHICLE_TYPE', 'Tipo de vehículo inválido, inactivo o pendiente de clasificación.');
+      }
+
+      const plateTypeCheck = validatePlateMatchesVehicleType(normalizedPlate, vehicleType);
+      if (!plateTypeCheck.ok) throw new AppError(400, 'PLATE_TYPE_MISMATCH', plateTypeCheck.message);
+
+      const [duplicates] = await conn.execute(
+        'SELECT id, active FROM vehicles WHERE normalized_plate = ? LIMIT 1 FOR UPDATE',
+        [normalizedPlate]
+      );
+      if (duplicates.length) {
+        throw new AppError(
+          409,
+          'PLATE_EXISTS',
+          `La placa ${normalizedPlate} ya está registrada${Number(duplicates[0].active) === 0 ? ' y se encuentra inactiva. Puedes activarla desde el listado' : ''}.`
+        );
+      }
+
+      const [insertResult] = await conn.execute(
+        `INSERT INTO vehicles (
+          normalized_plate, display_plate, vehicle_type_id, vehicle_category_id, active
+        ) VALUES (?, ?, ?, ?, ?)`,
+        [normalizedPlate, displayPlate, vehicleTypeId, vehicleType.vehicle_category_id, active]
+      );
+
+      const created = {
+        id: insertResult.insertId,
+        normalized_plate: normalizedPlate,
+        display_plate: displayPlate,
+        vehicle_type_id: vehicleTypeId,
+        vehicle_type_name: vehicleType.name,
+        vehicle_category_id: vehicleType.vehicle_category_id,
+        vehicle_category_name: vehicleType.vehicle_category_name,
+        active
+      };
+
+      notification = await createNotification(conn, {
+        type: 'vehicle:admin_created',
+        severity: 'SUCCESS',
+        title: 'Vehículo registrado',
+        message: `${req.user.name} registró la placa ${normalizedPlate} como ${vehicleType.name}.`,
+        payload: created
+      });
+
+      return created;
+    });
+
+    publishNotification(notification);
+    emitToAdmins('vehicle:created', result);
+    res.status(201).json({ success: true, message: 'Vehículo registrado correctamente.', data: result });
+  } catch (error) {
+    if (error?.code === 'ER_DUP_ENTRY') {
+      return next(new AppError(409, 'PLATE_EXISTS', 'Ya existe un vehículo registrado con esa placa.'));
+    }
+    next(error);
+  }
+});
+
 router.get('/:id/history', async (req, res, next) => {
   try {
     const [rows] = await pool.execute(`
