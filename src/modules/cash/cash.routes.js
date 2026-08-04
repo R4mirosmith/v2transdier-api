@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../../db/pool.js';
 import { authRequired, allowRoles } from '../../middlewares/auth.js';
 import { AppError } from '../../utils/errors.js';
+import { centsToMoney, moneyToCents } from '../../utils/money.js';
 
 const router = Router();
 router.use(authRequired);
@@ -34,7 +35,7 @@ router.post('/open', allowRoles('CASHIER','OPERATOR','ADMIN'), async (req, res, 
       const [insert] = await conn.execute(`
         INSERT INTO cash_sessions (user_id, company_id, ferry_id, journey_id, opening_amount)
         VALUES (?, ?, ?, ?, ?)
-      `, [req.user.id, journey.company_id, journey.ferry_id, journey_id, Number(opening_amount || 0)]);
+      `, [req.user.id, journey.company_id, journey.ferry_id, journey_id, centsToMoney(moneyToCents(opening_amount || 0))]);
       const [rows] = await conn.execute('SELECT * FROM cash_sessions WHERE id = ?', [insert.insertId]);
       return rows[0];
     });
@@ -59,9 +60,11 @@ router.post('/:id/close', allowRoles('CASHIER','OPERATOR','ADMIN'), async (req, 
           AND o.active_in_trip = 1
           AND EXISTS (SELECT 1 FROM trips t WHERE t.id = o.trip_id AND t.deleted_at_utc IS NULL)
       `, [session.id]);
-      const expected = Number(session.opening_amount) + Number(sumRows[0].total || 0);
-      const counted = Number(counted_amount || 0);
-      const diff = counted - expected;
+      const expectedCents = moneyToCents(session.opening_amount) + moneyToCents(sumRows[0].total || 0);
+      const countedCents = moneyToCents(counted_amount || 0);
+      const expected = centsToMoney(expectedCents);
+      const counted = centsToMoney(countedCents);
+      const diff = centsToMoney(countedCents - expectedCents);
       await conn.execute(`
         UPDATE cash_sessions
         SET status = 'CLOSED', counted_amount = ?, expected_amount = ?, difference_amount = ?, closed_at_utc = UTC_TIMESTAMP(), notes = ?

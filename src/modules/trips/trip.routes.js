@@ -6,7 +6,7 @@ import { upload, setUploadFolder } from '../../middlewares/upload.js';
 import { AppError } from '../../utils/errors.js';
 import { createNotification, publishNotification } from '../notifications/notification.service.js';
 import { emitToOperations } from '../../sockets/index.js';
-import { sendHtmlTableExport } from '../../utils/exporters.js';
+import { centsToMoney, moneyToCents } from '../../utils/money.js';
 
 const router = Router();
 router.use(authRequired);
@@ -107,81 +107,8 @@ router.get('/ferry/:ferryId/next-route', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-router.get('/export', allowRoles('ADMIN'), async (req, res, next) => {
-  try {
-    const journeyId = Number(req.query.journey_id);
-    if (!journeyId) throw new AppError(400, 'JOURNEY_REQUIRED', 'Debes seleccionar una jornada para exportar.');
-    const format = req.query.format === 'pdf' ? 'pdf' : 'excel';
-
-    const [rows] = await pool.execute(`
-      SELECT
-        j.id AS journey_id, j.opened_at_utc AS journey_opened_at_utc, j.status AS journey_status,
-        c.business_name AS company_name, f.name AS ferry_name,
-        t.id AS trip_id, t.status AS trip_status, t.opened_at_utc AS trip_opened_at_utc, t.closed_at_utc AS trip_closed_at_utc,
-        r.name AS route_name,
-        ou.name AS trip_opened_by_name,
-        cu.name AS trip_closed_by_name,
-        du.name AS trip_deleted_by_name,
-        t.delete_reason,
-        o.id AS operation_id, o.ticket_number, o.invoice_number, o.normalized_plate,
-        vt.name AS vehicle_type_name,
-        o.vehicle_category_id,
-        vc.code AS vehicle_category_code,
-        vc.name AS vehicle_category_name,
-        o.load_status, o.fare_price, o.payment_method, o.status AS operation_status,
-        o.active_in_trip, o.created_at_utc AS operation_created_at_utc,
-        rb.name AS registered_by_name,
-        bb.name AS billed_by_name,
-        rem.name AS removed_by_name,
-        o.removed_from_trip_reason
-      FROM trips t
-      JOIN journeys j ON j.id = t.journey_id
-      JOIN companies c ON c.id = t.company_id
-      JOIN ferries f ON f.id = t.ferry_id
-      JOIN routes r ON r.id = t.route_id
-      JOIN users ou ON ou.id = t.opened_by_user_id
-      LEFT JOIN users cu ON cu.id = t.closed_by_user_id
-      LEFT JOIN users du ON du.id = t.deleted_by_user_id
-      LEFT JOIN operations o ON o.trip_id = t.id AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED')
-      LEFT JOIN vehicle_types vt ON vt.id = o.vehicle_type_id
-      LEFT JOIN vehicle_categories vc ON vc.id = o.vehicle_category_id
-      LEFT JOIN users rb ON rb.id = o.registered_by_user_id
-      LEFT JOIN users bb ON bb.id = o.billed_by_user_id
-      LEFT JOIN users rem ON rem.id = o.removed_from_trip_by_user_id
-      WHERE t.journey_id = ? AND t.deleted_at_utc IS NULL
-      ORDER BY t.id DESC, o.id DESC
-    `, [journeyId]);
-
-    sendHtmlTableExport(res, {
-      filename: `transdier-trayectos-jornada-${journeyId}`,
-      format,
-      title: `Detalle de trayectos - Jornada ${journeyId}`,
-      rows,
-      columns: [
-        { header: 'Jornada', key: 'journey_id' },
-        { header: 'Empresa', key: 'company_name' },
-        { header: 'Ferry', key: 'ferry_name' },
-        { header: 'ID Trayecto', key: 'trip_id' },
-        { header: 'Trayecto', key: 'route_name' },
-        { header: 'Estado trayecto', key: 'trip_status' },
-        { header: 'Abrió trayecto', key: 'trip_opened_by_name' },
-        { header: 'Cerró trayecto', key: 'trip_closed_by_name' },
-        { header: 'Ticket', value: r => r.ticket_number || r.invoice_number || '' },
-        { header: 'Placa', key: 'normalized_plate' },
-        { header: 'Categoría real', key: 'vehicle_category_name' },
-        { header: 'Tipo / tarifa comercial', key: 'vehicle_type_name' },
-        { header: 'Condición', key: 'load_status' },
-        { header: 'Valor', key: 'fare_price' },
-        { header: 'Estado ticket', key: 'operation_status' },
-        { header: 'Activo en trayecto', value: r => r.operation_id ? (Number(r.active_in_trip) ? 'Sí' : 'No / retirado') : '' },
-        { header: 'Registró vehículo', key: 'registered_by_name' },
-        { header: 'Facturó ticket', key: 'billed_by_name' },
-        { header: 'Retiró vehículo', key: 'removed_by_name' },
-        { header: 'Motivo retiro', key: 'removed_from_trip_reason' },
-        { header: 'Fecha registro UTC', key: 'operation_created_at_utc' }
-      ]
-    });
-  } catch (error) { next(error); }
+router.get('/export', allowRoles('ADMIN'), async (_req, _res, next) => {
+  next(new AppError(410, 'EXPORT_MOVED_TO_REPORTS', 'Las exportaciones solo están disponibles en el módulo Reportes.'));
 });
 
 router.get('/journey/:journeyId/detail', async (req, res, next) => {
@@ -233,12 +160,17 @@ router.get('/journey/:journeyId/detail', async (req, res, next) => {
       return acc;
     }, {});
 
-    const totals = trips.reduce((acc, t) => {
+    const totalsInternal = trips.reduce((acc, t) => {
       acc.trips += 1;
       acc.vehicles += Number(t.operations_total || 0);
-      acc.income += Number(t.income_total || 0);
+      acc.income_cents += moneyToCents(t.income_total || 0);
       return acc;
-    }, { trips: 0, vehicles: 0, income: 0 });
+    }, { trips: 0, vehicles: 0, income_cents: 0 });
+    const totals = {
+      trips: totalsInternal.trips,
+      vehicles: totalsInternal.vehicles,
+      income: centsToMoney(totalsInternal.income_cents)
+    };
 
     res.json({ success: true, data: { trips, operations_by_trip: operationsByTrip, totals } });
   } catch (error) { next(error); }
