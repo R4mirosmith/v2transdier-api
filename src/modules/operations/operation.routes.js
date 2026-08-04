@@ -262,24 +262,36 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
       let vehicleId;
       const [vehicleRows] = await conn.execute('SELECT * FROM vehicles WHERE normalized_plate = ? FOR UPDATE', [normalizedPlate]);
       const existingVehicle = vehicleRows[0];
-      if (existingVehicle && Number(existingVehicle.vehicle_category_id) !== Number(vehicleType.vehicle_category_id)) {
-        const [oldCategoryRows] = await conn.execute(
-          'SELECT name, code FROM vehicle_categories WHERE id = ? LIMIT 1',
-          [existingVehicle.vehicle_category_id]
-        );
-        const oldCategoryName = oldCategoryRows[0]?.name || 'otra categoría';
+      if (existingVehicle && Number(existingVehicle.vehicle_type_id) !== vehicleTypeId) {
+        const [registeredTypeRows] = await conn.execute(`
+          SELECT
+            vt.id,
+            vt.name,
+            vt.vehicle_category_id,
+            vc.name AS vehicle_category_name
+          FROM vehicle_types vt
+          JOIN vehicle_categories vc ON vc.id = vt.vehicle_category_id
+          WHERE vt.id = ?
+          LIMIT 1
+        `, [existingVehicle.vehicle_type_id]);
+        const registeredType = registeredTypeRows[0];
+        const registeredTypeName = registeredType?.name || 'otro tipo de vehículo';
+        const registeredCategoryName = registeredType?.vehicle_category_name || 'otra categoría';
+
         throw new AppError(
           409,
-          'VEHICLE_CATEGORY_CONFLICT',
-          `La placa ${normalizedPlate} está registrada como ${oldCategoryName}. No puede cobrarse como ${vehicleType.vehicle_category_name}.`,
+          'VEHICLE_TYPE_CONFLICT',
+          `La placa ${normalizedPlate} está registrada como ${registeredTypeName}. Solo puede cobrarse con ese tipo; no puede cambiarse a ${vehicleType.name}.`,
           {
             plate: normalizedPlate,
-            old_vehicle_category_id: existingVehicle.vehicle_category_id,
-            old_vehicle_category_name: oldCategoryName,
-            attempted_vehicle_category_id: vehicleType.vehicle_category_id,
-            attempted_vehicle_category_name: vehicleType.vehicle_category_name,
+            registered_vehicle_type_id: existingVehicle.vehicle_type_id,
+            registered_vehicle_type_name: registeredTypeName,
+            registered_vehicle_category_id: existingVehicle.vehicle_category_id,
+            registered_vehicle_category_name: registeredCategoryName,
             attempted_vehicle_type_id: vehicleTypeId,
             attempted_vehicle_type_name: vehicleType.name,
+            attempted_vehicle_category_id: vehicleType.vehicle_category_id,
+            attempted_vehicle_category_name: vehicleType.vehicle_category_name,
             user_id: req.user.id
           }
         );

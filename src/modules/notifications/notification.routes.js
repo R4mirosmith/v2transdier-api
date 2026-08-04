@@ -301,11 +301,16 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
       );
       const existingVehicle = vehicleRows[0];
 
-      if (existingVehicle && Number(existingVehicle.vehicle_category_id) !== Number(request.vehicle_category_id)) {
+      if (existingVehicle && Number(existingVehicle.vehicle_type_id) !== Number(request.vehicle_type_id)) {
+        const [registeredTypeRows] = await conn.execute(
+          'SELECT name FROM vehicle_types WHERE id = ? LIMIT 1',
+          [existingVehicle.vehicle_type_id]
+        );
+        const registeredTypeName = registeredTypeRows[0]?.name || 'otro tipo de vehículo';
         throw new AppError(
           409,
-          'VEHICLE_CATEGORY_CONFLICT',
-          `La placa ${request.normalized_plate} ya existe con una categoría real diferente.`
+          'VEHICLE_TYPE_CONFLICT',
+          `La placa ${request.normalized_plate} ya está registrada como ${registeredTypeName}. La autorización no puede cambiar su tipo.`
         );
       }
 
@@ -320,8 +325,8 @@ router.post('/restricted-vehicle-requests/:id/allow', allowRoles('ADMIN'), async
         vehicleId = insertVehicle.insertId;
       } else {
         await conn.execute(
-          'UPDATE vehicles SET vehicle_type_id = ?, vehicle_category_id = ?, active = 1, updated_at_utc = UTC_TIMESTAMP() WHERE id = ?',
-          [request.vehicle_type_id, request.vehicle_category_id, vehicleId]
+          'UPDATE vehicles SET active = 1, updated_at_utc = UTC_TIMESTAMP() WHERE id = ?',
+          [vehicleId]
         );
       }
 
