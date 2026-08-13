@@ -90,9 +90,48 @@ const operationsSelect = `
   LEFT JOIN users tcu ON tcu.id = t.closed_by_user_id
 `;
 
+function mergeVehicleTypeTotals(individualRows = [], batchRows = []) {
+  const map = new Map();
+  for (const row of [...individualRows, ...batchRows]) {
+    const vehicleTypeId = Number(row.vehicle_type_id);
+    const vehicleCategoryId = Number(row.vehicle_category_id);
+    const loadStatus = String(row.load_status || 'NA');
+    const key = `${vehicleCategoryId}-${vehicleTypeId}-${loadStatus}`;
+    if (!map.has(key)) map.set(key, {
+      vehicle_type_id: vehicleTypeId,
+      vehicle_type_name: row.vehicle_type_name || row.name || '',
+      name: row.name || row.vehicle_type_name || '',
+      vehicle_category_id: vehicleCategoryId,
+      vehicle_category_name: row.vehicle_category_name || '',
+      vehicle_category_code: row.vehicle_category_code || '',
+      load_status: loadStatus,
+      qty: 0,
+      total: 0
+    });
+    const current = map.get(key);
+    current.qty += Number(row.qty || 0);
+    current.total = centsToMoney(moneyToCents(current.total) + moneyToCents(row.total || 0));
+  }
+  return [...map.values()].sort((a, b) => String(a.vehicle_category_name).localeCompare(String(b.vehicle_category_name), 'es') || String(a.vehicle_type_name).localeCompare(String(b.vehicle_type_name), 'es'));
+}
+
 router.get('/dashboard', allowRoles('ADMIN'), async (req, res, next) => {
   try {
     const report = await buildFinancialReport(req.query);
+    const fromDate = new Date(`${report.filter.from}T12:00:00Z`);
+    const toDate = new Date(`${report.filter.to}T12:00:00Z`);
+    const periodDays = Math.max(1, Math.round((toDate - fromDate) / 86400000) + 1);
+    const previousToDate = new Date(fromDate);
+    previousToDate.setUTCDate(previousToDate.getUTCDate() - 1);
+    const previousFromDate = new Date(previousToDate);
+    previousFromDate.setUTCDate(previousFromDate.getUTCDate() - (periodDays - 1));
+    const previousFrom = previousFromDate.toISOString().slice(0, 10);
+    const previousTo = previousToDate.toISOString().slice(0, 10);
+    const previousReport = await buildFinancialReport({
+      from: previousFrom,
+      to: previousTo,
+      ferry_id: report.filter.ferry_id || undefined
+    });
     const [openJourneys] = await pool.execute("SELECT COUNT(*) AS total FROM journeys WHERE status = 'OPEN'");
     const [openTrips] = await pool.execute("SELECT COUNT(*) AS total FROM trips WHERE status = 'OPEN' AND deleted_at_utc IS NULL");
 
@@ -119,8 +158,34 @@ router.get('/dashboard', allowRoles('ADMIN'), async (req, res, next) => {
       }
     }
 
-    const boarded = report.operations.filter(o => o.status === 'BOARDED').length;
-    const pendingBoard = report.operations.filter(o => ['PAID', 'EXEMPT'].includes(o.status)).length;
+    const boarded = Number(report.summary.boarded_total || 0);
+    const pendingBoard = Number(report.summary.pending_board_total || 0);
+
+    const pctChange = (current, previous) => {
+      const now = Number(current || 0);
+      const before = Number(previous || 0);
+      if (before === 0) return now === 0 ? 0 : null;
+      return Number((((now - before) / Math.abs(before)) * 100).toFixed(1));
+    };
+    const topType = [...(report.by_vehicle_type || [])].sort((a, b) => Number(b.qty || 0) - Number(a.qty || 0))[0] || null;
+    const topTrip = [...(report.by_trip || [])].sort((a, b) => moneyToCents(b.income_total) - moneyToCents(a.income_total))[0] || null;
+    const hourly = new Map();
+    for (const op of report.operations || []) {
+      const raw = op.created_at_utc;
+      if (!raw) continue;
+      const utc = new Date(String(raw).endsWith('Z') ? raw : `${String(raw).replace(' ', 'T')}Z`);
+      if (Number.isNaN(utc.getTime())) continue;
+      const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Bogota', hour: '2-digit', hour12: false }).format(utc));
+      const qty = Math.max(1, Number(op.quantity || 1));
+      const current = hourly.get(hour) || { hour, vehicles: 0, income_cents: 0 };
+      current.vehicles += qty;
+      current.income_cents += operationIncomeCents(op);
+      hourly.set(hour, current);
+    }
+    const hourlyTrend = [...hourly.values()]
+      .sort((a, b) => a.hour - b.hour)
+      .map(row => ({ hour: row.hour, label: `${String(row.hour).padStart(2, '0')}:00`, vehicles: row.vehicles, income: centsToMoney(row.income_cents) }));
+    const peakHour = [...hourlyTrend].sort((a, b) => b.vehicles - a.vehicles || moneyToCents(b.income) - moneyToCents(a.income))[0] || null;
 
     res.json({
       success: true,
@@ -176,7 +241,26 @@ router.get('/dashboard', allowRoles('ADMIN'), async (req, res, next) => {
         type_totals: report.by_vehicle_type,
         operations_detail: report.operations,
         billed_by_totals: report.by_user,
-        integrity: report.integrity
+        integrity: report.integrity,
+        trends: {
+          previous_from: previousFrom,
+          previous_to: previousTo,
+          income_pct: pctChange(report.summary.income_total, previousReport.summary.income_total),
+          expenses_pct: pctChange(report.summary.expenses_total, previousReport.summary.expenses_total),
+          net_pct: pctChange(report.summary.net_total, previousReport.summary.net_total),
+          vehicles_pct: pctChange(report.summary.vehicles_total, previousReport.summary.vehicles_total),
+          current: report.summary,
+          previous: previousReport.summary
+        },
+        insights: {
+          average_income_per_vehicle: report.summary.vehicles_total ? centsToMoney(Math.round(moneyToCents(report.summary.income_total) / Number(report.summary.vehicles_total))) : 0,
+          average_income_per_trip: report.summary.trips_total ? centsToMoney(Math.round(moneyToCents(report.summary.income_total) / Number(report.summary.trips_total))) : 0,
+          average_vehicles_per_trip: report.summary.trips_total ? Number((Number(report.summary.vehicles_total) / Number(report.summary.trips_total)).toFixed(1)) : 0,
+          top_vehicle_type: topType,
+          top_trip: topTrip,
+          peak_hour: peakHour,
+          hourly: hourlyTrend
+        }
       }
     });
   } catch (error) { next(error); }
@@ -208,10 +292,46 @@ router.get('/journey/:journeyId/summary', allowRoles('ADMIN'), async (req, res, 
       GROUP BY o.vehicle_type_id, vt.name, o.vehicle_category_id, vc.name, vc.code, o.load_status
       ORDER BY vt.name, o.load_status
     `, [req.params.journeyId]);
+    const [batchSummary] = await pool.execute(`
+      SELECT
+        COALESCE(SUM(mb.quantity), 0) AS total_operations,
+        COALESCE(SUM(mb.total_amount), 0) AS total_cash,
+        COALESCE(SUM(mb.quantity), 0) AS boarded,
+        0 AS pending_board,
+        0 AS cancelled,
+        0 AS exempt
+      FROM motorcycle_batch_operations mb
+      JOIN trips t ON t.id = mb.trip_id
+      WHERE mb.journey_id = ?
+        AND mb.active_in_trip = 1
+        AND t.deleted_at_utc IS NULL
+    `, [req.params.journeyId]);
+    const [batchByType] = await pool.execute(`
+      SELECT
+        mb.vehicle_type_id,
+        vt.name,
+        vt.name AS vehicle_type_name,
+        mb.vehicle_category_id,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
+        'NA' AS load_status,
+        COALESCE(SUM(mb.quantity), 0) AS qty,
+        COALESCE(SUM(mb.total_amount), 0) AS total
+      FROM motorcycle_batch_operations mb
+      JOIN trips t ON t.id = mb.trip_id
+      JOIN vehicle_types vt ON vt.id = mb.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = mb.vehicle_category_id
+      WHERE mb.journey_id = ?
+        AND mb.active_in_trip = 1
+        AND t.deleted_at_utc IS NULL
+      GROUP BY mb.vehicle_type_id, vt.name, mb.vehicle_category_id, vc.name, vc.code
+    `, [req.params.journeyId]);
     const [trips] = await pool.execute(`
       SELECT t.*, r.name AS route_name,
-        COALESCE(SUM(CASE WHEN o.status IN ('PAID','BOARDED') AND o.payment_method='CASH' THEN o.fare_price ELSE 0 END),0) AS total_cash,
-        COUNT(o.id) AS total_operations
+        (COALESCE(SUM(CASE WHEN o.status IN ('PAID','BOARDED') AND o.payment_method='CASH' THEN o.fare_price ELSE 0 END),0)
+          + COALESCE((SELECT SUM(mb.total_amount) FROM motorcycle_batch_operations mb WHERE mb.trip_id = t.id AND mb.active_in_trip = 1), 0)) AS total_cash,
+        (COUNT(o.id)
+          + COALESCE((SELECT SUM(mb.quantity) FROM motorcycle_batch_operations mb WHERE mb.trip_id = t.id AND mb.active_in_trip = 1), 0)) AS total_operations
       FROM trips t
       JOIN routes r ON r.id = t.route_id
       LEFT JOIN operations o ON o.trip_id = t.id AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED')
@@ -227,7 +347,17 @@ router.get('/journey/:journeyId/summary', allowRoles('ADMIN'), async (req, res, 
       FROM cash_sessions cs JOIN users u ON u.id = cs.user_id
       WHERE cs.journey_id = ? ORDER BY cs.id DESC
     `, [req.params.journeyId]);
-    res.json({ success: true, data: { summary: summary[0], by_type: byType, trips, expenses, cash_sessions: cash } });
+    const individualSummary = summary[0] || {};
+    const aggregateSummary = batchSummary[0] || {};
+    const combinedSummary = {
+      total_operations: Number(individualSummary.total_operations || 0) + Number(aggregateSummary.total_operations || 0),
+      total_cash: centsToMoney(moneyToCents(individualSummary.total_cash || 0) + moneyToCents(aggregateSummary.total_cash || 0)),
+      boarded: Number(individualSummary.boarded || 0) + Number(aggregateSummary.boarded || 0),
+      pending_board: Number(individualSummary.pending_board || 0) + Number(aggregateSummary.pending_board || 0),
+      cancelled: Number(individualSummary.cancelled || 0),
+      exempt: Number(individualSummary.exempt || 0)
+    };
+    res.json({ success: true, data: { summary: combinedSummary, by_type: mergeVehicleTypeTotals(byType, batchByType), trips, expenses, cash_sessions: cash } });
   } catch (error) { next(error); }
 });
 
@@ -269,7 +399,44 @@ router.get('/trip/:tripId/summary', async (req, res, next) => {
       GROUP BY o.vehicle_type_id, vt.name, o.vehicle_category_id, vc.name, vc.code
       ORDER BY vc.name, vt.name
     `, [req.params.tripId]);
-    res.json({ success: true, data: { summary: summary[0], by_type: byType } });
+    const [batchSummary] = await pool.execute(`
+      SELECT
+        COALESCE(SUM(mb.quantity), 0) AS total_operations,
+        COALESCE(SUM(mb.total_amount), 0) AS income_total,
+        0 AS exempt_total
+      FROM motorcycle_batch_operations mb
+      JOIN trips t ON t.id = mb.trip_id
+      WHERE mb.trip_id = ?
+        AND mb.active_in_trip = 1
+        AND t.deleted_at_utc IS NULL
+    `, [req.params.tripId]);
+    const [batchByType] = await pool.execute(`
+      SELECT
+        mb.vehicle_type_id,
+        vt.name AS vehicle_type_name,
+        mb.vehicle_category_id,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
+        'NA' AS load_status,
+        COALESCE(SUM(mb.quantity), 0) AS qty,
+        COALESCE(SUM(mb.total_amount), 0) AS total
+      FROM motorcycle_batch_operations mb
+      JOIN trips t ON t.id = mb.trip_id
+      JOIN vehicle_types vt ON vt.id = mb.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = mb.vehicle_category_id
+      WHERE mb.trip_id = ?
+        AND mb.active_in_trip = 1
+        AND t.deleted_at_utc IS NULL
+      GROUP BY mb.vehicle_type_id, vt.name, mb.vehicle_category_id, vc.name, vc.code
+    `, [req.params.tripId]);
+    const individualSummary = summary[0] || {};
+    const aggregateSummary = batchSummary[0] || {};
+    const combinedSummary = {
+      total_operations: Number(individualSummary.total_operations || 0) + Number(aggregateSummary.total_operations || 0),
+      income_total: centsToMoney(moneyToCents(individualSummary.income_total || 0) + moneyToCents(aggregateSummary.income_total || 0)),
+      exempt_total: Number(individualSummary.exempt_total || 0)
+    };
+    res.json({ success: true, data: { summary: combinedSummary, by_type: mergeVehicleTypeTotals(byType, batchByType) } });
   } catch (error) { next(error); }
 });
 
@@ -300,8 +467,15 @@ router.get('/travel-history', allowRoles('ADMIN', 'CASHIER', 'OPERATOR'), async 
             AND ox.status NOT IN ('ANNULLED','REMOVED')
             AND (ox.registered_by_user_id = ? OR ox.billed_by_user_id = ? OR ox.boarding_user_id = ?)
         )
+        OR EXISTS (
+          SELECT 1
+          FROM motorcycle_batch_operations mbx
+          WHERE mbx.trip_id = t.id
+            AND mbx.active_in_trip = 1
+            AND (mbx.registered_by_user_id = ? OR mbx.billed_by_user_id = ?)
+        )
       )`;
-      tripParams.push(ownUserId, ownUserId, ownUserId, ownUserId, ownUserId);
+      tripParams.push(ownUserId, ownUserId, ownUserId, ownUserId, ownUserId, ownUserId, ownUserId);
     }
 
     const [tripRows] = await pool.execute(`
@@ -350,7 +524,73 @@ router.get('/travel-history', allowRoles('ADMIN', 'CASHIER', 'OPERATOR'), async 
       ORDER BY j.opened_at_utc DESC, o.trip_id DESC, o.id DESC
     `, opParams);
 
-    const operationsByTrip = operations.reduce((acc, op) => {
+    const batchParams = [startUtc, endUtc];
+    let batchWhere = `
+      mb.active_in_trip = 1
+      AND t.deleted_at_utc IS NULL
+      AND j.opened_at_utc BETWEEN ? AND ?
+    `;
+    if (ferryId) { batchWhere += ' AND mb.ferry_id = ?'; batchParams.push(ferryId); }
+    if (ownUserId) {
+      batchWhere += ' AND (mb.registered_by_user_id = ? OR mb.billed_by_user_id = ?)';
+      batchParams.push(ownUserId, ownUserId);
+    }
+
+    const [batchRows] = await pool.execute(`
+      SELECT
+        CONCAT('batch:', mb.id) AS id,
+        mb.id AS batch_id,
+        'MOTORCYCLE_BATCH' AS record_kind,
+        mb.company_id,
+        mb.journey_id,
+        mb.trip_id,
+        mb.ferry_id,
+        mb.vehicle_type_id,
+        mb.vehicle_category_id,
+        mb.quantity,
+        mb.unit_price,
+        mb.total_amount AS fare_price,
+        mb.created_at_utc,
+        CONCAT(mb.quantity, ' MOTOS') AS normalized_plate,
+        CONCAT(mb.quantity, ' MOTOS') AS display_plate,
+        'NA' AS load_status,
+        'CASH' AS payment_method,
+        'BOARDED' AS status,
+        NULL AS ticket_number,
+        NULL AS invoice_number,
+        vt.name AS vehicle_type_name,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
+        mb.registered_by_user_id,
+        rb.name AS registered_by_name,
+        mb.billed_by_user_id,
+        bb.name AS billed_by_name,
+        NULL AS boarding_user_id,
+        NULL AS boarding_by_name,
+        f.name AS ferry_name,
+        c.business_name AS company_name,
+        r.name AS route_name,
+        DATE_FORMAT(CONVERT_TZ(j.opened_at_utc, '+00:00', '-05:00'), '%Y-%m-%d') AS journey_local_date
+      FROM motorcycle_batch_operations mb
+      JOIN vehicle_types vt ON vt.id = mb.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = mb.vehicle_category_id
+      JOIN users rb ON rb.id = mb.registered_by_user_id
+      JOIN users bb ON bb.id = mb.billed_by_user_id
+      JOIN ferries f ON f.id = mb.ferry_id
+      JOIN companies c ON c.id = mb.company_id
+      JOIN journeys j ON j.id = mb.journey_id
+      JOIN trips t ON t.id = mb.trip_id
+      JOIN routes r ON r.id = t.route_id
+      WHERE ${batchWhere}
+      ORDER BY j.opened_at_utc DESC, mb.trip_id DESC, mb.id DESC
+    `, batchParams);
+
+    const allOperations = [
+      ...operations.map(op => ({ ...op, record_kind: 'INDIVIDUAL', quantity: 1 })),
+      ...batchRows
+    ].sort((a, b) => new Date(b.created_at_utc || 0) - new Date(a.created_at_utc || 0));
+
+    const operationsByTrip = allOperations.reduce((acc, op) => {
       const key = String(op.trip_id);
       if (!acc[key]) acc[key] = [];
       acc[key].push(op);
@@ -366,18 +606,19 @@ router.get('/travel-history', allowRoles('ADMIN', 'CASHIER', 'OPERATOR'), async 
       let exemptTotal = 0;
 
       for (const op of tripOps) {
+        const quantity = Math.max(1, Number(op.quantity || 1));
         const isCashIncome = ['PAID', 'BOARDED'].includes(op.status) && op.payment_method === 'CASH';
         const countsAsOwnIncome = canSeeAll || Number(op.billed_by_user_id) === ownUserId;
         if (isCashIncome && countsAsOwnIncome) incomeCents += moneyToCents(op.fare_price);
-        if (ownUserId && Number(op.registered_by_user_id) === ownUserId) registeredTotal += 1;
-        if (ownUserId && Number(op.billed_by_user_id) === ownUserId) billedTotal += 1;
-        if (ownUserId && Number(op.boarding_user_id) === ownUserId) boardedTotal += 1;
-        if (op.payment_method === 'EXEMPT') exemptTotal += 1;
+        if (ownUserId && Number(op.registered_by_user_id) === ownUserId) registeredTotal += quantity;
+        if (ownUserId && Number(op.billed_by_user_id) === ownUserId) billedTotal += quantity;
+        if (ownUserId && Number(op.boarding_user_id) === ownUserId) boardedTotal += quantity;
+        if (op.payment_method === 'EXEMPT') exemptTotal += quantity;
       }
 
       return {
         ...trip,
-        operations_total: tripOps.length,
+        operations_total: tripOps.reduce((sum, op) => sum + Math.max(1, Number(op.quantity || 1)), 0),
         income_total: centsToMoney(incomeCents),
         exempt_total: exemptTotal,
         registered_total: ownUserId ? registeredTotal : null,
@@ -393,12 +634,12 @@ router.get('/travel-history', allowRoles('ADMIN', 'CASHIER', 'OPERATOR'), async 
     const summary = {
       journeys_total: journeyIds.size,
       trips_total: trips.length,
-      vehicles_total: operations.length,
+      vehicles_total: allOperations.reduce((sum, op) => sum + Math.max(1, Number(op.quantity || 1)), 0),
       income_total: centsToMoney(summaryIncomeCents),
-      exempt_total: operations.filter(op => op.payment_method === 'EXEMPT').length,
-      registered_total: ownUserId ? operations.filter(op => Number(op.registered_by_user_id) === ownUserId).length : null,
-      billed_total: ownUserId ? operations.filter(op => Number(op.billed_by_user_id) === ownUserId).length : null,
-      boarded_total: ownUserId ? operations.filter(op => Number(op.boarding_user_id) === ownUserId).length : null
+      exempt_total: allOperations.reduce((sum, op) => sum + (op.payment_method === 'EXEMPT' ? Math.max(1, Number(op.quantity || 1)) : 0), 0),
+      registered_total: ownUserId ? allOperations.reduce((sum, op) => sum + (Number(op.registered_by_user_id) === ownUserId ? Math.max(1, Number(op.quantity || 1)) : 0), 0) : null,
+      billed_total: ownUserId ? allOperations.reduce((sum, op) => sum + (Number(op.billed_by_user_id) === ownUserId ? Math.max(1, Number(op.quantity || 1)) : 0), 0) : null,
+      boarded_total: ownUserId ? allOperations.reduce((sum, op) => sum + (Number(op.boarding_user_id) === ownUserId ? Math.max(1, Number(op.quantity || 1)) : 0), 0) : null
     };
 
     const byJourney = Array.from(trips.reduce((map, trip) => {
@@ -635,6 +876,79 @@ async function buildFinancialReport(query) {
     ORDER BY j.opened_at_utc DESC, f.name, t.id DESC, o.id DESC
   `, opParams);
 
+  const batchParams = [startUtc, endUtc];
+  let batchWhere = `
+    mb.active_in_trip = 1
+    AND t.deleted_at_utc IS NULL
+    AND j.opened_at_utc BETWEEN ? AND ?
+  `;
+  if (ferryId) { batchWhere += ' AND mb.ferry_id = ?'; batchParams.push(ferryId); }
+
+  const [motorcycleBatches] = await pool.execute(`
+    SELECT
+      CONCAT('batch:', mb.id) AS id,
+      mb.id AS batch_id,
+      'MOTORCYCLE_BATCH' AS record_kind,
+      mb.company_id,
+      mb.journey_id,
+      mb.trip_id,
+      mb.ferry_id,
+      mb.vehicle_type_id,
+      mb.vehicle_category_id,
+      mb.quantity,
+      mb.unit_price,
+      mb.total_amount AS fare_price,
+      mb.created_at_utc,
+      CONCAT(mb.quantity, ' MOTOS') AS normalized_plate,
+      CONCAT(mb.quantity, ' MOTOS') AS display_plate,
+      'NA' AS load_status,
+      'CASH' AS payment_method,
+      'BOARDED' AS status,
+      vt.name AS vehicle_type_name,
+      vc.name AS vehicle_category_name,
+      vc.code AS vehicle_category_code,
+      vc.plate_category,
+      mb.registered_by_user_id,
+      rb.name AS registered_by_name,
+      rb.role AS registered_by_role,
+      mb.billed_by_user_id,
+      bb.name AS billed_by_name,
+      bb.role AS billed_by_role,
+      rb.name AS cashier_name,
+      NULL AS boarding_by_name,
+      f.name AS ferry_name,
+      c.business_name AS company_name,
+      r.name AS route_name,
+      DATE_FORMAT(CONVERT_TZ(j.opened_at_utc, '+00:00', '-05:00'), '%Y-%m-%d') AS journey_local_date,
+      j.status AS journey_status,
+      t.status AS trip_status,
+      t.opened_at_utc AS trip_opened_at_utc,
+      t.closed_at_utc AS trip_closed_at_utc,
+      t.opened_by_user_id,
+      tu.name AS trip_opened_by_name,
+      t.closed_by_user_id,
+      tcu.name AS trip_closed_by_name
+    FROM motorcycle_batch_operations mb
+    JOIN vehicle_types vt ON vt.id = mb.vehicle_type_id
+    JOIN vehicle_categories vc ON vc.id = mb.vehicle_category_id
+    JOIN users rb ON rb.id = mb.registered_by_user_id
+    JOIN users bb ON bb.id = mb.billed_by_user_id
+    JOIN ferries f ON f.id = mb.ferry_id
+    JOIN companies c ON c.id = mb.company_id
+    JOIN journeys j ON j.id = mb.journey_id
+    JOIN trips t ON t.id = mb.trip_id
+    JOIN routes r ON r.id = t.route_id
+    LEFT JOIN users tu ON tu.id = t.opened_by_user_id
+    LEFT JOIN users tcu ON tcu.id = t.closed_by_user_id
+    WHERE ${batchWhere}
+    ORDER BY j.opened_at_utc DESC, f.name, t.id DESC, mb.id DESC
+  `, batchParams);
+
+  const financialOperations = [
+    ...operations.map(operation => ({ ...operation, record_kind: 'INDIVIDUAL', quantity: 1 })),
+    ...motorcycleBatches
+  ].sort((a, b) => new Date(b.created_at_utc || 0) - new Date(a.created_at_utc || 0));
+
   const expenseParams = [startUtc, endUtc, startUtc, endUtc];
   let expenseWhere = `
     e.status = 'ACTIVE'
@@ -763,25 +1077,26 @@ async function buildFinancialReport(query) {
     ensureTrip(trip);
   }
 
-  for (const operation of operations) {
+  for (const operation of financialOperations) {
     const incomeCents = operationIncomeCents(operation);
-    const isExempt = operation.payment_method === 'EXEMPT' ? 1 : 0;
+    const quantity = Math.max(1, Number(operation.quantity || 1));
+    const isExempt = operation.payment_method === 'EXEMPT' ? quantity : 0;
 
     const ferry = ensureFerry(operation);
-    ferry.vehicles_total += 1;
+    ferry.vehicles_total += quantity;
     ferry.exempt_total += isExempt;
     pushCents(ferry, 'income_total', incomeCents);
 
     const journey = ensureJourney(operation);
     if (journey) {
-      journey.vehicles_total += 1;
+      journey.vehicles_total += quantity;
       journey.exempt_total += isExempt;
       pushCents(journey, 'income_total', incomeCents);
     }
 
     const trip = ensureTrip(operation);
     if (trip) {
-      trip.vehicles_total += 1;
+      trip.vehicles_total += quantity;
       trip.exempt_total += isExempt;
       pushCents(trip, 'income_total', incomeCents);
     }
@@ -796,7 +1111,7 @@ async function buildFinancialReport(query) {
       _income_total_cents: 0
     });
     const user = byUser.get(userKey);
-    user.vehicles_total += 1;
+    user.vehicles_total += quantity;
     user.exempt_total += isExempt;
     pushCents(user, 'income_total', incomeCents);
 
@@ -823,7 +1138,7 @@ async function buildFinancialReport(query) {
       types: []
     });
     const userTrip = byUserTrip.get(userTripKey);
-    userTrip.vehicles_total += 1;
+    userTrip.vehicles_total += quantity;
     userTrip.exempt_total += isExempt;
     pushCents(userTrip, 'income_total', incomeCents);
 
@@ -841,7 +1156,7 @@ async function buildFinancialReport(query) {
       _total_cents: 0
     });
     const tripType = typeByTrip.get(tripTypeKey);
-    tripType.qty += 1;
+    tripType.qty += quantity;
     tripType.exempt_total += isExempt;
     pushCents(tripType, 'total', incomeCents);
 
@@ -859,7 +1174,7 @@ async function buildFinancialReport(query) {
       _total_cents: 0
     });
     const userTripType = typeByUserTrip.get(userTripTypeKey);
-    userTripType.qty += 1;
+    userTripType.qty += quantity;
     userTripType.exempt_total += isExempt;
     pushCents(userTripType, 'total', incomeCents);
 
@@ -876,7 +1191,7 @@ async function buildFinancialReport(query) {
       _total_cents: 0
     });
     const vehicleType = byVehicleType.get(globalTypeKey);
-    vehicleType.qty += 1;
+    vehicleType.qty += quantity;
     vehicleType.exempt_total += isExempt;
     pushCents(vehicleType, 'total', incomeCents);
 
@@ -890,7 +1205,7 @@ async function buildFinancialReport(query) {
       _total_cents: 0
     });
     const category = byVehicleCategory.get(categoryKey);
-    category.qty += 1;
+    category.qty += quantity;
     category.exempt_total += isExempt;
     pushCents(category, 'total', incomeCents);
   }
@@ -973,10 +1288,10 @@ async function buildFinancialReport(query) {
     trip._net_total_cents = centsOf(trip, 'income_total') - centsOf(trip, 'expenses_total');
   }
 
-  const totalIncomeCents = operations.reduce((sum, operation) => sum + operationIncomeCents(operation), 0);
+  const totalIncomeCents = financialOperations.reduce((sum, operation) => sum + operationIncomeCents(operation), 0);
   const totalExpensesCents = expenses.reduce((sum, expense) => sum + moneyToCents(expense.amount), 0);
-  const totalVehicles = operations.length;
-  const totalExempt = operations.filter(operation => operation.payment_method === 'EXEMPT').length;
+  const totalVehicles = financialOperations.reduce((sum, operation) => sum + Math.max(1, Number(operation.quantity || 1)), 0);
+  const totalExempt = financialOperations.reduce((sum, operation) => sum + (operation.payment_method === 'EXEMPT' ? Math.max(1, Number(operation.quantity || 1)) : 0), 0);
 
   const ferryRowsInternal = Array.from(byFerry.values());
   const journeyRowsInternal = Array.from(byJourney.values());
@@ -996,6 +1311,12 @@ async function buildFinancialReport(query) {
     integrityCheck('Gastos = trayecto + jornada + generales', tripExpensesCents + journeyLevelExpensesCents + generalExpensesCents, totalExpensesCents),
     integrityCheck('Vehículos = suma por operador', userRowsInternal.reduce((sum, row) => sum + Number(row.vehicles_total || 0), 0), totalVehicles, 'count'),
     integrityCheck('Vehículos = suma por tipo', typeRowsInternal.reduce((sum, row) => sum + Number(row.qty || 0), 0), totalVehicles, 'count'),
+    integrityCheck(
+      'Motos por cantidad = cantidad × tarifa',
+      motorcycleBatches.filter(batch => moneyToCents(batch.fare_price) !== moneyToCents(batch.unit_price) * Number(batch.quantity || 0)).length,
+      0,
+      'count'
+    ),
     integrityCheck('Neto = suma por ferry', sumInternalCents(ferryRowsInternal, 'net_total'), totalIncomeCents - totalExpensesCents)
   ];
 
@@ -1035,9 +1356,9 @@ async function buildFinancialReport(query) {
       journeys_total: journeys.length,
       trips_total: trips.length,
       expenses_count: expenses.length,
-      cash_operations_total: operations.filter(operation => operation.payment_method === 'CASH').length,
-      boarded_total: operations.filter(operation => operation.status === 'BOARDED').length,
-      pending_board_total: operations.filter(operation => ['PAID', 'EXEMPT'].includes(operation.status)).length,
+      cash_operations_total: financialOperations.reduce((sum, operation) => sum + (operation.payment_method === 'CASH' ? Math.max(1, Number(operation.quantity || 1)) : 0), 0),
+      boarded_total: financialOperations.reduce((sum, operation) => sum + (operation.status === 'BOARDED' ? Math.max(1, Number(operation.quantity || 1)) : 0), 0),
+      pending_board_total: financialOperations.reduce((sum, operation) => sum + (['PAID', 'EXEMPT'].includes(operation.status) ? Math.max(1, Number(operation.quantity || 1)) : 0), 0),
       general_expenses_total: centsToMoney(generalExpensesCents),
       journey_level_expenses_total: centsToMoney(journeyLevelExpensesCents),
       trip_expenses_total: centsToMoney(tripExpensesCents)
@@ -1057,7 +1378,7 @@ async function buildFinancialReport(query) {
     by_user_trip: byUserTripFinal,
     by_vehicle_type: byVehicleTypeFinal,
     by_vehicle_category: byVehicleCategoryFinal,
-    operations,
+    operations: financialOperations,
     expenses
   };
 }
@@ -1130,7 +1451,16 @@ router.get('/financial/export', allowRoles('ADMIN', 'SECRETARIA'), async (req, r
     rows.push({ section: '', concept: '', detail: '', qty: '', income: '', expenses: '', net: '', extra: '' });
 
     rows.push({ section: 'TICKETS', concept: 'Ticket/Placa', detail: 'Trayecto/Ferry', qty: 'Tipo', income: 'Valor', expenses: '', net: '', extra: 'Registró / Facturó' });
-    for (const o of report.operations) rows.push({ section: 'TICKETS', concept: `${o.ticket_number || o.invoice_number} · ${o.normalized_plate}`, detail: `${o.route_name} · ${o.ferry_name} · ${o.journey_local_date}`, qty: `${o.vehicle_category_name || 'Sin categoría'} · ${o.vehicle_type_name} · ${condicionTexto(o.load_status)}`, income: localMoney(o.payment_method === 'CASH' ? o.fare_price : 0), expenses: '', net: '', extra: `${o.registered_by_name} / ${o.billed_by_name}` });
+    for (const o of report.operations) rows.push({
+      section: 'TICKETS',
+      concept: o.record_kind === 'MOTORCYCLE_BATCH' ? `Registro por cantidad · ${o.quantity} motos` : `${o.ticket_number || o.invoice_number} · ${o.normalized_plate}`,
+      detail: `${o.route_name} · ${o.ferry_name} · ${o.journey_local_date}`,
+      qty: o.record_kind === 'MOTORCYCLE_BATCH' ? `${o.quantity} × ${o.vehicle_type_name}` : `${o.vehicle_category_name || 'Sin categoría'} · ${o.vehicle_type_name} · ${condicionTexto(o.load_status)}`,
+      income: localMoney(o.payment_method === 'CASH' ? o.fare_price : 0),
+      expenses: '',
+      net: '',
+      extra: `${o.registered_by_name} / ${o.billed_by_name}`
+    });
 
     sendHtmlTableExport(res, {
       filename: `transdier-reporte-financiero-${filter.from}-${filter.to}`,
@@ -1300,9 +1630,9 @@ function buildCompleteExportRows(report, { includeExpenses = true } = {}) {
     rows.push({
       section: 'DETALLE DE TICKETS',
       group: `Jornada #${operation.journey_id} · Trayecto #${operation.trip_id}`,
-      concept: `${operation.ticket_number || operation.invoice_number} · ${operation.normalized_plate}`,
+      concept: operation.record_kind === 'MOTORCYCLE_BATCH' ? `Registro por cantidad · ${operation.quantity} motos` : `${operation.ticket_number || operation.invoice_number} · ${operation.normalized_plate}`,
       detail: `${operation.ferry_name} · ${operation.route_name} · ${operation.vehicle_category_name || 'Sin categoría'} · ${operation.vehicle_type_name} · ${condicionTexto(operation.load_status)} · ${estadoOperacionTexto(operation.status)}`,
-      quantity: 1,
+      quantity: Math.max(1, Number(operation.quantity || 1)),
       income: localMoney(centsToMoney(operationIncomeCents(operation))),
       expenses: '', net: '',
       responsible: `Registró: ${operation.registered_by_name} · Facturó: ${operation.billed_by_name}${operation.boarding_by_name ? ` · Embarcó: ${operation.boarding_by_name}` : ''}`,
@@ -1529,7 +1859,8 @@ function buildCompleteStructuredReport(report, { includeExpenses = true } = {}) 
     created_at_local: colombiaDateTime(row.created_at_utc),
     journey_label: `#${row.journey_id}`,
     trip_label: `#${row.trip_id}`,
-    ticket_label: row.ticket_number || row.invoice_number || '',
+    ticket_label: row.record_kind === 'MOTORCYCLE_BATCH' ? 'Registro por cantidad' : (row.ticket_number || row.invoice_number || ''),
+    normalized_plate: row.record_kind === 'MOTORCYCLE_BATCH' ? `${row.quantity} motos` : row.normalized_plate,
     vehicle_text: `${row.vehicle_category_name || 'Sin categoría'} / ${row.vehicle_type_name}`,
     load_status_text: condicionTexto(row.load_status),
     operation_status_text: estadoOperacionTexto(row.status),

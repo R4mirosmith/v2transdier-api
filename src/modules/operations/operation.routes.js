@@ -8,6 +8,7 @@ import { AppError } from '../../utils/errors.js';
 import { normalizePlate, validatePlate, validatePlateMatchesVehicleType } from '../../utils/plates.js';
 import { createNotification, publishNotification } from '../notifications/notification.service.js';
 import { emitToAdmins, emitToOperations } from '../../sockets/index.js';
+import { centsToMoney } from '../../utils/money.js';
 
 const router = Router();
 router.use(authRequired);
@@ -57,6 +58,20 @@ function ticketNumberFor(id) {
   return `TK-${String(id).padStart(6, '0')}`;
 }
 
+const MOTORCYCLE_BATCH_UNIT_PRICE_CENTS = 800000; // $8.000 COP por moto.
+
+function motorcycleBatchMigrationError(error) {
+  const message = String(error?.message || '');
+  if (error?.code === 'ER_NO_SUCH_TABLE' && message.includes('motorcycle_batch_operations')) {
+    return new AppError(
+      400,
+      'MOTORCYCLE_BATCH_NEEDS_MIGRATION',
+      'Falta la tabla para registrar motos por cantidad. Ejecuta database/migration_registro_motos_por_cantidad.sql antes de publicar este backend.'
+    );
+  }
+  return null;
+}
+
 const operationSelect = `
   SELECT o.*, vt.name AS vehicle_type_name, vt.code AS vehicle_type_code,
     vc.name AS vehicle_category_name, vc.code AS vehicle_category_code, vc.plate_category,
@@ -73,6 +88,68 @@ const operationSelect = `
   JOIN routes r ON r.id = t.route_id
   JOIN ferries f ON f.id = o.ferry_id
   JOIN companies c ON c.id = o.company_id
+`;
+
+const motorcycleBatchSelect = `
+  SELECT
+    CONCAT('batch:', mb.id) AS id,
+    mb.id AS batch_id,
+    'MOTORCYCLE_BATCH' AS record_kind,
+    mb.company_id,
+    mb.journey_id,
+    mb.trip_id,
+    mb.ferry_id,
+    mb.vehicle_type_id,
+    mb.vehicle_category_id,
+    mb.quantity,
+    mb.unit_price,
+    mb.total_amount AS fare_price,
+    mb.active_in_trip,
+    mb.created_at_utc,
+    CONCAT(mb.quantity, ' MOTOS') AS normalized_plate,
+    CONCAT(mb.quantity, ' MOTOS') AS display_plate,
+    'NA' AS load_status,
+    'CASH' AS payment_method,
+    'BOARDED' AS status,
+    NULL AS ticket_number,
+    NULL AS invoice_number,
+    NULL AS vehicle_id,
+    NULL AS driver_id,
+    'REGISTRO POR CANTIDAD' AS driver_name,
+    '' AS driver_document,
+    '' AS driver_phone,
+    mb.registered_by_user_id,
+    mb.billed_by_user_id,
+    mb.registered_by_user_id AS cashier_user_id,
+    vt.name AS vehicle_type_name,
+    vt.code AS vehicle_type_code,
+    vc.name AS vehicle_category_name,
+    vc.code AS vehicle_category_code,
+    vc.plate_category,
+    rb.name AS registered_by_name,
+    bb.name AS billed_by_name,
+    rb.name AS cashier_name,
+    r.name AS route_name,
+    f.name AS ferry_name,
+    c.business_name AS company_name,
+    c.trade_name,
+    c.nit,
+    c.logo_path,
+    c.address,
+    c.phone,
+    c.electronic_billing_phone_1,
+    c.electronic_billing_phone_2,
+    c.email,
+    c.ticket_footer
+  FROM motorcycle_batch_operations mb
+  JOIN vehicle_types vt ON vt.id = mb.vehicle_type_id
+  JOIN vehicle_categories vc ON vc.id = mb.vehicle_category_id
+  JOIN users rb ON rb.id = mb.registered_by_user_id
+  JOIN users bb ON bb.id = mb.billed_by_user_id
+  JOIN trips t ON t.id = mb.trip_id
+  JOIN routes r ON r.id = t.route_id
+  JOIN ferries f ON f.id = mb.ferry_id
+  JOIN companies c ON c.id = mb.company_id
 `;
 
 router.get('/plate-lookup/:plate', allowRoles('CASHIER','OPERATOR','ADMIN'), async (req, res, next) => {
@@ -162,8 +239,176 @@ router.get('/trip/:tripId', async (req, res, next) => {
         AND t.deleted_at_utc IS NULL
       ORDER BY o.id DESC
     `, [req.params.tripId]);
-    res.json({ success: true, data: rows });
-  } catch (error) { next(error); }
+    const [batches] = await pool.execute(`
+      ${motorcycleBatchSelect}
+      WHERE mb.trip_id = ?
+        AND mb.active_in_trip = 1
+        AND t.deleted_at_utc IS NULL
+      ORDER BY mb.id DESC
+    `, [req.params.tripId]);
+    const data = [
+      ...rows.map(row => ({ ...row, record_kind: 'INDIVIDUAL', quantity: 1 })),
+      ...batches
+    ].sort((a, b) => new Date(b.created_at_utc || 0) - new Date(a.created_at_utc || 0));
+    res.json({ success: true, data });
+  } catch (error) {
+    next(motorcycleBatchMigrationError(error) || error);
+  }
+});
+
+router.post('/register-motorcycle-batch', allowRoles('CASHIER','OPERATOR','ADMIN'), async (req, res, next) => {
+  let notification = null;
+  try {
+    const tripId = Number(req.body.trip_id);
+    const quantity = Number(req.body.quantity);
+    const requestedVehicleTypeId = Number(req.body.vehicle_type_id || 0);
+
+    if (!Number.isInteger(tripId) || tripId <= 0) {
+      throw new AppError(400, 'TRIP_REQUIRED', 'Debes seleccionar un trayecto válido.');
+    }
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 5000) {
+      throw new AppError(400, 'INVALID_MOTORCYCLE_QUANTITY', 'La cantidad de motos debe ser un número entero entre 1 y 5000.');
+    }
+
+    const result = await withTransaction(async (conn) => {
+      const [tripRows] = await conn.execute(`
+        SELECT t.*, j.status AS journey_status
+        FROM trips t
+        JOIN journeys j ON j.id = t.journey_id
+        WHERE t.id = ? AND t.deleted_at_utc IS NULL
+        FOR UPDATE
+      `, [tripId]);
+      const trip = tripRows[0];
+      const isAdminClosedTripCorrection = req.user.role === 'ADMIN' && trip?.status === 'CLOSED';
+      const isNormalOpenTrip = trip?.status === 'OPEN' && trip?.journey_status === 'OPEN';
+      if (!trip || (!isNormalOpenTrip && !isAdminClosedTripCorrection)) {
+        throw new AppError(400, 'TRIP_NOT_WORKABLE', 'El trayecto no está disponible para registrar motos. Solo el admin puede corregir un trayecto cerrado.');
+      }
+
+      const typeParams = [];
+      let typeFilter = '';
+      if (requestedVehicleTypeId) {
+        typeFilter = ' AND vt.id = ?';
+        typeParams.push(requestedVehicleTypeId);
+      } else {
+        typeFilter = " AND (UPPER(vt.code) = 'MOTO' OR UPPER(vt.name) = 'MOTO')";
+      }
+
+      const [typeRows] = await conn.execute(`
+        SELECT vt.*, vc.name AS vehicle_category_name, vc.code AS vehicle_category_code
+        FROM vehicle_types vt
+        JOIN vehicle_categories vc ON vc.id = vt.vehicle_category_id
+        WHERE vt.active = 1
+          AND vt.category_review_required = 0
+          AND vc.active = 1
+          AND UPPER(vc.code) = 'MOTO'
+          AND vt.registration_restricted = 0
+          ${typeFilter}
+        ORDER BY CASE WHEN UPPER(vt.code) = 'MOTO' THEN 0 ELSE 1 END, vt.id
+        LIMIT 1
+      `, typeParams);
+      const vehicleType = typeRows[0];
+      if (!vehicleType) {
+        throw new AppError(
+          400,
+          'MOTORCYCLE_TYPE_NOT_AVAILABLE',
+          'No hay un tipo de moto habilitado para registro por cantidad. El registro masivo no puede usar tipos restringidos ni otras categorías.'
+        );
+      }
+
+      const unitPrice = centsToMoney(MOTORCYCLE_BATCH_UNIT_PRICE_CENTS);
+      const totalAmount = centsToMoney(MOTORCYCLE_BATCH_UNIT_PRICE_CENTS * quantity);
+
+      const [insert] = await conn.execute(`
+        INSERT INTO motorcycle_batch_operations (
+          company_id, journey_id, trip_id, ferry_id,
+          vehicle_type_id, vehicle_category_id,
+          quantity, unit_price, total_amount,
+          registered_by_user_id, billed_by_user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        trip.company_id,
+        trip.journey_id,
+        trip.id,
+        trip.ferry_id,
+        vehicleType.id,
+        vehicleType.vehicle_category_id,
+        quantity,
+        unitPrice,
+        totalAmount,
+        req.user.id,
+        req.user.id
+      ]);
+
+      const [createdRows] = await conn.execute(`
+        ${motorcycleBatchSelect}
+        WHERE mb.id = ?
+      `, [insert.insertId]);
+      const batch = createdRows[0];
+
+      notification = await createNotification(conn, {
+        type: 'motorcycle:batch_registered',
+        severity: 'SUCCESS',
+        title: 'Motos registradas por cantidad',
+        message: `${req.user.name} registró ${quantity} motos × $8.000 = $${Number(totalAmount).toLocaleString('es-CO')} en el trayecto #${trip.id}.`,
+        payload: {
+          motorcycle_batch_id: insert.insertId,
+          trip_id: trip.id,
+          quantity,
+          unit_price: unitPrice,
+          total_amount: totalAmount,
+          vehicle_type_id: vehicleType.id,
+          registered_by_user_id: req.user.id,
+          admin_closed_trip_correction: isAdminClosedTripCorrection
+        }
+      });
+      return batch;
+    });
+
+    publishNotification(notification);
+    emitToOperations('operation:registered', { id: result.id, trip_id: result.trip_id, record_kind: 'MOTORCYCLE_BATCH' });
+    res.status(201).json({ success: true, data: result });
+  } catch (error) {
+    next(motorcycleBatchMigrationError(error) || error);
+  }
+});
+
+router.post('/motorcycle-batch/:id/remove-from-trip', allowRoles('ADMIN'), async (req, res, next) => {
+  let notification = null;
+  try {
+    const batchId = Number(req.params.id);
+    const reason = String(req.body.reason || '').trim() || 'Registro de motos retirado del trayecto por administrador';
+    const result = await withTransaction(async (conn) => {
+      const [rows] = await conn.execute('SELECT * FROM motorcycle_batch_operations WHERE id = ? FOR UPDATE', [batchId]);
+      const batch = rows[0];
+      if (!batch) throw new AppError(404, 'NOT_FOUND', 'Registro de motos no encontrado.');
+      if (!Number(batch.active_in_trip)) throw new AppError(409, 'ALREADY_REMOVED', 'Este registro de motos ya fue retirado del trayecto.');
+
+      await conn.execute(`
+        UPDATE motorcycle_batch_operations
+        SET active_in_trip = 0,
+            removed_from_trip_at_utc = UTC_TIMESTAMP(),
+            removed_from_trip_by_user_id = ?,
+            removed_from_trip_reason = ?
+        WHERE id = ?
+      `, [req.user.id, reason, batchId]);
+
+      notification = await createNotification(conn, {
+        type: 'motorcycle:batch_removed',
+        severity: 'WARNING',
+        title: 'Registro de motos retirado',
+        message: `${req.user.name} retiró un registro de ${batch.quantity} motos del trayecto #${batch.trip_id}.`,
+        payload: { motorcycle_batch_id: batchId, trip_id: batch.trip_id, quantity: batch.quantity, reason }
+      });
+      return { id: batchId, trip_id: batch.trip_id, active_in_trip: 0 };
+    });
+
+    publishNotification(notification);
+    emitToOperations('operation:removed', { id: `batch:${result.id}`, trip_id: result.trip_id, record_kind: 'MOTORCYCLE_BATCH' });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(motorcycleBatchMigrationError(error) || error);
+  }
 });
 
 router.get('/:id', async (req, res, next) => {

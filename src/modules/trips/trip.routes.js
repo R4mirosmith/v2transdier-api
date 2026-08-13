@@ -20,6 +20,14 @@ function tripIncomeExpression(alias = 'o') {
   return `COALESCE(SUM(CASE WHEN ${alias}.active_in_trip = 1 AND ${alias}.status IN ('PAID','BOARDED') AND ${alias}.payment_method = 'CASH' THEN ${alias}.fare_price ELSE 0 END), 0)`;
 }
 
+function batchIncomeExpression(tripAlias = 't') {
+  return `COALESCE((SELECT SUM(mb.total_amount) FROM motorcycle_batch_operations mb WHERE mb.trip_id = ${tripAlias}.id AND mb.active_in_trip = 1), 0)`;
+}
+
+function batchVehicleCountExpression(tripAlias = 't') {
+  return `COALESCE((SELECT SUM(mb.quantity) FROM motorcycle_batch_operations mb WHERE mb.trip_id = ${tripAlias}.id AND mb.active_in_trip = 1), 0)`;
+}
+
 router.get('/open', async (req, res, next) => {
   try {
     const tripId = Number(req.query.trip_id || 0);
@@ -32,8 +40,8 @@ router.get('/open', async (req, res, next) => {
     const [rows] = await pool.execute(`
       SELECT t.*, r.name AS route_name, r.origin_name, r.destination_name, j.ferry_id, j.status AS journey_status, f.name AS ferry_name, c.business_name AS company_name,
         ou.name AS opened_by_name,
-        ${tripIncomeExpression('o')} AS income_total,
-        COUNT(o.id) AS operations_total
+        (${tripIncomeExpression('o')} + ${batchIncomeExpression('t')}) AS income_total,
+        (COUNT(o.id) + ${batchVehicleCountExpression('t')}) AS operations_total
       FROM trips t
       JOIN journeys j ON j.id = t.journey_id
       JOIN ferries f ON f.id = j.ferry_id
@@ -117,8 +125,8 @@ router.get('/journey/:journeyId/detail', async (req, res, next) => {
       SELECT t.*, r.name AS route_name, r.origin_name, r.destination_name,
         c.business_name AS company_name, f.name AS ferry_name,
         ou.name AS opened_by_name, cu.name AS closed_by_name, du.name AS deleted_by_name,
-        ${tripIncomeExpression('o')} AS income_total,
-        COUNT(o.id) AS operations_total,
+        (${tripIncomeExpression('o')} + ${batchIncomeExpression('t')}) AS income_total,
+        (COUNT(o.id) + ${batchVehicleCountExpression('t')}) AS operations_total,
         0 AS removed_total
       FROM trips t
       JOIN companies c ON c.id = t.company_id
@@ -153,12 +161,69 @@ router.get('/journey/:journeyId/detail', async (req, res, next) => {
       ORDER BY o.trip_id DESC, o.id DESC
     `, [req.params.journeyId]);
 
+    const [motorcycleBatches] = await pool.execute(`
+      SELECT
+        CONCAT('batch:', mb.id) AS id,
+        mb.id AS batch_id,
+        'MOTORCYCLE_BATCH' AS record_kind,
+        mb.trip_id,
+        mb.journey_id,
+        mb.ferry_id,
+        mb.vehicle_type_id,
+        mb.vehicle_category_id,
+        mb.quantity,
+        mb.unit_price,
+        mb.total_amount AS fare_price,
+        mb.active_in_trip,
+        mb.created_at_utc,
+        CONCAT(mb.quantity, ' MOTOS') AS normalized_plate,
+        CONCAT(mb.quantity, ' MOTOS') AS display_plate,
+        NULL AS ticket_number,
+        NULL AS invoice_number,
+        'NA' AS load_status,
+        'CASH' AS payment_method,
+        'BOARDED' AS status,
+        vt.name AS vehicle_type_name,
+        vt.code AS vehicle_type_code,
+        vc.name AS vehicle_category_name,
+        vc.code AS vehicle_category_code,
+        vc.plate_category,
+        r.name AS route_name,
+        f.name AS ferry_name,
+        rb.name AS registered_by_name,
+        bb.name AS billed_by_name,
+        rb.name AS cashier_name,
+        NULL AS removed_by_name
+      FROM motorcycle_batch_operations mb
+      JOIN vehicle_types vt ON vt.id = mb.vehicle_type_id
+      JOIN vehicle_categories vc ON vc.id = mb.vehicle_category_id
+      JOIN trips t ON t.id = mb.trip_id
+      JOIN routes r ON r.id = t.route_id
+      JOIN ferries f ON f.id = mb.ferry_id
+      JOIN users rb ON rb.id = mb.registered_by_user_id
+      JOIN users bb ON bb.id = mb.billed_by_user_id
+      WHERE mb.journey_id = ?
+        AND mb.active_in_trip = 1
+        AND t.deleted_at_utc IS NULL
+      ORDER BY mb.trip_id DESC, mb.id DESC
+    `, [req.params.journeyId]);
+
     const operationsByTrip = operations.reduce((acc, op) => {
       const key = String(op.trip_id);
       if (!acc[key]) acc[key] = [];
-      acc[key].push(op);
+      acc[key].push({ ...op, record_kind: 'INDIVIDUAL', quantity: 1 });
       return acc;
     }, {});
+
+    for (const batch of motorcycleBatches) {
+      const key = String(batch.trip_id);
+      if (!operationsByTrip[key]) operationsByTrip[key] = [];
+      operationsByTrip[key].push(batch);
+    }
+
+    for (const key of Object.keys(operationsByTrip)) {
+      operationsByTrip[key].sort((a, b) => new Date(b.created_at_utc || 0) - new Date(a.created_at_utc || 0));
+    }
 
     const totalsInternal = trips.reduce((acc, t) => {
       acc.trips += 1;
@@ -180,8 +245,8 @@ router.get('/journey/:journeyId', async (req, res, next) => {
   try {
     const [rows] = await pool.execute(`
       SELECT t.*, r.name AS route_name, ou.name AS opened_by_name, cu.name AS closed_by_name,
-        ${tripIncomeExpression('o')} AS income_total,
-        COUNT(o.id) AS operations_total
+        (${tripIncomeExpression('o')} + ${batchIncomeExpression('t')}) AS income_total,
+        (COUNT(o.id) + ${batchVehicleCountExpression('t')}) AS operations_total
       FROM trips t
       JOIN routes r ON r.id = t.route_id
       JOIN users ou ON ou.id = t.opened_by_user_id
