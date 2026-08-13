@@ -8,7 +8,7 @@ import { AppError } from '../../utils/errors.js';
 import { normalizePlate, validatePlate, validatePlateMatchesVehicleType } from '../../utils/plates.js';
 import { createNotification, publishNotification } from '../notifications/notification.service.js';
 import { emitToAdmins, emitToOperations } from '../../sockets/index.js';
-import { centsToMoney } from '../../utils/money.js';
+import { centsToMoney, moneyToCents } from '../../utils/money.js';
 
 const router = Router();
 router.use(authRequired);
@@ -58,7 +58,6 @@ function ticketNumberFor(id) {
   return `TK-${String(id).padStart(6, '0')}`;
 }
 
-const MOTORCYCLE_BATCH_UNIT_PRICE_CENTS = 800000; // $8.000 COP por moto.
 
 function motorcycleBatchMigrationError(error) {
   const message = String(error?.message || '');
@@ -316,8 +315,50 @@ router.post('/register-motorcycle-batch', allowRoles('CASHIER','OPERATOR','ADMIN
         );
       }
 
-      const unitPrice = centsToMoney(MOTORCYCLE_BATCH_UNIT_PRICE_CENTS);
-      const totalAmount = centsToMoney(MOTORCYCLE_BATCH_UNIT_PRICE_CENTS * quantity);
+      if (Number(vehicleType.requires_load_status)) {
+        throw new AppError(
+          400,
+          'MOTORCYCLE_BATCH_LOAD_STATUS_NOT_SUPPORTED',
+          'Este tipo de moto usa tarifas por condición y no puede registrarse por cantidad. Configura un tipo de moto con tarifa única.'
+        );
+      }
+
+      const [fareRows] = await conn.execute(`
+        SELECT price
+        FROM vehicle_fares
+        WHERE vehicle_type_id = ?
+          AND load_status = 'NA'
+          AND active = 1
+        LIMIT 1
+        FOR UPDATE
+      `, [vehicleType.id]);
+      if (!fareRows.length) {
+        throw new AppError(
+          400,
+          'NO_ACTIVE_MOTORCYCLE_BATCH_FARE',
+          `No hay una tarifa activa configurada para ${vehicleType.name}. Configúrala antes de registrar motos por cantidad.`
+        );
+      }
+
+      const unitPriceCents = moneyToCents(fareRows[0].price);
+      if (unitPriceCents < 0) {
+        throw new AppError(400, 'INVALID_MOTORCYCLE_BATCH_FARE', 'La tarifa configurada para este tipo de moto no es válida.');
+      }
+      const unitPrice = centsToMoney(unitPriceCents);
+
+      if (req.body.expected_unit_price !== undefined && req.body.expected_unit_price !== null && req.body.expected_unit_price !== '') {
+        const expectedUnitPriceCents = moneyToCents(req.body.expected_unit_price);
+        if (expectedUnitPriceCents !== unitPriceCents) {
+          throw new AppError(
+            409,
+            'MOTORCYCLE_BATCH_FARE_CHANGED',
+            `La tarifa de ${vehicleType.name} cambió a $${Number(unitPrice).toLocaleString('es-CO')}. Revisa el nuevo total y vuelve a confirmar.`,
+            { vehicle_type_id: vehicleType.id, unit_price: unitPrice }
+          );
+        }
+      }
+
+      const totalAmount = centsToMoney(unitPriceCents * quantity);
 
       const [insert] = await conn.execute(`
         INSERT INTO motorcycle_batch_operations (
@@ -350,7 +391,7 @@ router.post('/register-motorcycle-batch', allowRoles('CASHIER','OPERATOR','ADMIN
         type: 'motorcycle:batch_registered',
         severity: 'SUCCESS',
         title: 'Motos registradas por cantidad',
-        message: `${req.user.name} registró ${quantity} motos × $8.000 = $${Number(totalAmount).toLocaleString('es-CO')} en el trayecto #${trip.id}.`,
+        message: `${req.user.name} registró ${quantity} motos × $${Number(unitPrice).toLocaleString('es-CO')} = $${Number(totalAmount).toLocaleString('es-CO')} en el trayecto #${trip.id}.`,
         payload: {
           motorcycle_batch_id: insert.insertId,
           trip_id: trip.id,
