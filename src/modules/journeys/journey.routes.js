@@ -3,6 +3,7 @@ import { pool, withTransaction } from '../../db/pool.js';
 import { authRequired, allowRoles } from '../../middlewares/auth.js';
 import { AppError } from '../../utils/errors.js';
 import { colombiaEndOfDayUtcForNow } from '../../utils/time.js';
+import { validatePlate } from '../../utils/plates.js';
 import { createNotification, publishNotification } from '../notifications/notification.service.js';
 
 const router = Router();
@@ -69,6 +70,102 @@ router.post('/open', allowRoles('ADMIN'), async (req, res, next) => {
     });
     publishNotification(notification);
     res.status(201).json({ success: true, data: result });
+  } catch (error) { next(error); }
+});
+
+
+router.get('/:id/free-passes', allowRoles('ADMIN'), async (req, res, next) => {
+  try {
+    const journeyId = Number(req.params.id);
+    if (!journeyId) throw new AppError(400, 'INVALID_JOURNEY', 'Jornada inválida.');
+    const [rows] = await pool.execute(`
+      SELECT p.*, u.name AS authorized_by_name, j.status AS journey_status, f.name AS ferry_name,
+             GREATEST(p.allowed_uses - p.used_uses, 0) AS remaining_uses
+      FROM journey_free_passes p
+      JOIN journeys j ON j.id = p.journey_id
+      JOIN ferries f ON f.id = j.ferry_id
+      JOIN users u ON u.id = p.authorized_by_user_id
+      WHERE p.journey_id = ?
+      ORDER BY p.active DESC, p.id DESC
+    `, [journeyId]);
+    res.json({ success: true, data: rows });
+  } catch (error) { next(error); }
+});
+
+router.post('/:id/free-passes', allowRoles('ADMIN'), async (req, res, next) => {
+  try {
+    const journeyId = Number(req.params.id);
+    const allowedUses = Number(req.body.allowed_uses);
+    const plateCheck = validatePlate(req.body.plate);
+    if (!journeyId) throw new AppError(400, 'INVALID_JOURNEY', 'Jornada inválida.');
+    if (!plateCheck.ok) throw new AppError(400, 'INVALID_PLATE', plateCheck.message);
+    if (!Number.isInteger(allowedUses) || allowedUses < 1 || allowedUses > 100) {
+      throw new AppError(400, 'INVALID_FREE_PASS_LIMIT', 'La cantidad de pases debe estar entre 1 y 100.');
+    }
+
+    let notification;
+    const result = await withTransaction(async (conn) => {
+      const [journeyRows] = await conn.execute(`
+        SELECT j.*, f.name AS ferry_name
+        FROM journeys j JOIN ferries f ON f.id = j.ferry_id
+        WHERE j.id = ? FOR UPDATE
+      `, [journeyId]);
+      const journey = journeyRows[0];
+      if (!journey) throw new AppError(404, 'JOURNEY_NOT_FOUND', 'Jornada no encontrada.');
+      if (journey.status !== 'OPEN') throw new AppError(409, 'JOURNEY_CLOSED', 'Solo puedes autorizar pases en una jornada abierta.');
+
+      const [existingRows] = await conn.execute(`
+        SELECT * FROM journey_free_passes WHERE journey_id = ? AND normalized_plate = ? FOR UPDATE
+      `, [journeyId, plateCheck.normalized]);
+      const existing = existingRows[0];
+      if (existing && allowedUses < Number(existing.used_uses)) {
+        throw new AppError(409, 'FREE_PASS_LIMIT_BELOW_USED', `Esta placa ya usó ${existing.used_uses} pase(s). No puedes dejar el límite por debajo de lo consumido.`);
+      }
+
+      if (existing) {
+        await conn.execute(`
+          UPDATE journey_free_passes
+          SET display_plate = ?, allowed_uses = ?, active = 1, authorized_by_user_id = ?, updated_at_utc = UTC_TIMESTAMP()
+          WHERE id = ?
+        `, [String(req.body.plate || '').trim().toUpperCase(), allowedUses, req.user.id, existing.id]);
+      } else {
+        await conn.execute(`
+          INSERT INTO journey_free_passes (journey_id, normalized_plate, display_plate, allowed_uses, authorized_by_user_id)
+          VALUES (?, ?, ?, ?, ?)
+        `, [journeyId, plateCheck.normalized, String(req.body.plate || '').trim().toUpperCase(), allowedUses, req.user.id]);
+      }
+
+      const [rows] = await conn.execute(`
+        SELECT p.*, u.name AS authorized_by_name, GREATEST(p.allowed_uses - p.used_uses, 0) AS remaining_uses
+        FROM journey_free_passes p JOIN users u ON u.id = p.authorized_by_user_id
+        WHERE p.journey_id = ? AND p.normalized_plate = ?
+      `, [journeyId, plateCheck.normalized]);
+
+      notification = await createNotification(conn, {
+        type: 'journey:free_pass_authorized', severity: 'INFO', title: 'Pases gratis autorizados',
+        message: `${req.user.name} autorizó ${allowedUses} pase(s) gratis para ${plateCheck.normalized} en la jornada #${journeyId}.`,
+        payload: { journey_id: journeyId, plate: plateCheck.normalized, allowed_uses: allowedUses }
+      });
+      return rows[0];
+    });
+    publishNotification(notification);
+    res.status(201).json({ success: true, data: result });
+  } catch (error) { next(error); }
+});
+
+router.delete('/:id/free-passes/:passId', allowRoles('ADMIN'), async (req, res, next) => {
+  try {
+    const journeyId = Number(req.params.id);
+    const passId = Number(req.params.passId);
+    if (!journeyId || !passId) throw new AppError(400, 'INVALID_FREE_PASS', 'Autorización inválida.');
+    const [result] = await pool.execute(`
+      UPDATE journey_free_passes p
+      JOIN journeys j ON j.id = p.journey_id
+      SET p.active = 0, p.updated_at_utc = UTC_TIMESTAMP()
+      WHERE p.id = ? AND p.journey_id = ? AND j.status = 'OPEN'
+    `, [passId, journeyId]);
+    if (!result.affectedRows) throw new AppError(404, 'FREE_PASS_NOT_ACTIVE', 'No se encontró un pase activo en una jornada abierta.');
+    res.json({ success: true, data: { id: passId, active: 0 } });
   } catch (error) { next(error); }
 });
 

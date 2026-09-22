@@ -706,10 +706,26 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
       const [exemptRows] = await conn.execute('SELECT * FROM exempt_plates WHERE normalized_plate = ? AND active = 1 LIMIT 1', [normalizedPlate]);
       const isExempt = !!exemptRows[0];
 
+      let freePass = null;
+      if (!isExempt && trip.journey_status === 'OPEN') {
+        const [freePassRows] = await conn.execute(`
+          SELECT *
+          FROM journey_free_passes
+          WHERE journey_id = ?
+            AND normalized_plate = ?
+            AND active = 1
+            AND used_uses < allowed_uses
+          LIMIT 1
+          FOR UPDATE
+        `, [trip.journey_id, normalizedPlate]);
+        freePass = freePassRows[0] || null;
+      }
+
       let price = 0;
       let paymentMethod = 'EXEMPT';
       let status = 'EXEMPT';
-      if (!isExempt) {
+      let billingKind = isExempt ? 'EXEMPT' : (freePass ? 'JOURNEY_FREE_PASS' : 'NORMAL');
+      if (!isExempt && !freePass) {
         const [fareRows] = await conn.execute(`
           SELECT price FROM vehicle_fares
           WHERE vehicle_type_id = ? AND load_status = ? AND active = 1
@@ -721,34 +737,44 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
         status = 'PAID';
       }
 
+      if (freePass) {
+        await conn.execute(`
+          UPDATE journey_free_passes
+          SET used_uses = used_uses + 1,
+              active = CASE WHEN used_uses + 1 >= allowed_uses THEN 0 ELSE active END,
+              updated_at_utc = UTC_TIMESTAMP()
+          WHERE id = ?
+        `, [freePass.id]);
+      }
+
       const [insertOp] = await conn.execute(`
         INSERT INTO operations (
           company_id, journey_id, trip_id, ferry_id, vehicle_id, normalized_plate, display_plate,
           vehicle_type_id, vehicle_category_id, load_status,
-          driver_id, driver_name, driver_document, driver_phone, fare_price, payment_method, status,
+          driver_id, driver_name, driver_document, driver_phone, fare_price, payment_method, status, billing_kind, journey_free_pass_id,
           registered_by_user_id, billed_by_user_id, cashier_user_id, cash_session_id, optional_payment_photo_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         trip.company_id, trip.journey_id, tripId, trip.ferry_id, vehicleId, normalizedPlate, displayPlate,
         vehicleTypeId, vehicleType.vehicle_category_id, loadStatus,
-        driverId, driverName, driverDocument, driverPhone, price, paymentMethod, status,
+        driverId, driverName, driverDocument, driverPhone, price, paymentMethod, status, billingKind, freePass?.id || null,
         req.user.id, req.user.id, req.user.id, cashSession?.id || null, paymentPhotoPath
       ]);
 
       const opId = insertOp.insertId;
       const ticketNumber = ticketNumberFor(opId);
       await conn.execute('UPDATE operations SET ticket_number = ?, invoice_number = ? WHERE id = ?', [ticketNumber, ticketNumber, opId]);
-      await conn.execute('INSERT INTO operation_events (operation_id, event_type, user_id, details_json) VALUES (?, ?, ?, ?)', [opId, 'REGISTERED_AND_TICKETED', req.user.id, JSON.stringify({ price, loadStatus, paymentMethod, ticketNumber, admin_closed_trip_correction: isAdminClosedTripCorrection })]);
+      await conn.execute('INSERT INTO operation_events (operation_id, event_type, user_id, details_json) VALUES (?, ?, ?, ?)', [opId, 'REGISTERED_AND_TICKETED', req.user.id, JSON.stringify({ price, loadStatus, paymentMethod, billingKind, journey_free_pass_id: freePass?.id || null, ticketNumber, admin_closed_trip_correction: isAdminClosedTripCorrection })]);
 
       const [opRows] = await conn.execute(`${operationSelect} WHERE o.id = ?`, [opId]);
       const operation = opRows[0];
 
       pendingNotification = await createNotification(conn, {
         type: 'vehicle:registered',
-        severity: isExempt ? 'WARNING' : 'SUCCESS',
-        title: isAdminClosedTripCorrection ? 'Vehículo agregado a trayecto cerrado' : (isExempt ? 'Exonerado registrado' : 'Vehículo cobrado'),
-        message: `${req.user.name} facturó ${normalizedPlate} (${vehicleType.name}) por $${price.toLocaleString('es-CO')}${isAdminClosedTripCorrection ? ' como corrección administrativa de trayecto cerrado' : ''}.`,
-        payload: { operation_id: opId, trip_id: tripId, plate: normalizedPlate, price, status, ticket_number: ticketNumber, registered_by_user_id: req.user.id, billed_by_user_id: req.user.id, admin_closed_trip_correction: isAdminClosedTripCorrection }
+        severity: (isExempt || freePass) ? 'WARNING' : 'SUCCESS',
+        title: isAdminClosedTripCorrection ? 'Vehículo agregado a trayecto cerrado' : (isExempt ? 'Exonerado registrado' : (freePass ? 'Pase gratis consumido' : 'Vehículo cobrado')),
+        message: `${req.user.name} facturó ${normalizedPlate} (${vehicleType.name}) por $${price.toLocaleString('es-CO')}${freePass ? ` usando pase gratis de jornada (${Number(freePass.allowed_uses) - Number(freePass.used_uses) - 1} restante(s))` : ''}${isAdminClosedTripCorrection ? ' como corrección administrativa de trayecto cerrado' : ''}.`,
+        payload: { operation_id: opId, trip_id: tripId, plate: normalizedPlate, price, status, billing_kind: billingKind, journey_free_pass_id: freePass?.id || null, ticket_number: ticketNumber, registered_by_user_id: req.user.id, billed_by_user_id: req.user.id, admin_closed_trip_correction: isAdminClosedTripCorrection }
       });
       return operation;
     });
