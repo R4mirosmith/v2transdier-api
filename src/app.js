@@ -19,6 +19,7 @@ import ferryRoutes from './modules/ferries/ferry.routes.js';
 import expenseRoutes from './modules/expenses/expense.routes.js';
 import vehicleTypeRoutes from './modules/vehicle-types/vehicleType.routes.js';
 import vehicleRoutes from './modules/vehicles/vehicle.routes.js';
+import camviewRoutes from './modules/camview/camview.routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,6 +57,7 @@ export function createApp() {
   app.use('/api/expenses', expenseRoutes);
   app.use('/api/vehicle-types', vehicleTypeRoutes);
   app.use('/api/vehicles', vehicleRoutes);
+  app.use('/api/camview', camviewRoutes);
 
   app.use(errorHandler);
   return app;

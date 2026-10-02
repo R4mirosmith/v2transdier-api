@@ -377,7 +377,8 @@ router.get('/trip/:tripId/summary', async (req, res, next) => {
     const [summary] = await pool.execute(`
       SELECT COUNT(*) AS total_operations,
              COALESCE(SUM(CASE WHEN status IN ('PAID','BOARDED') AND payment_method='CASH' THEN fare_price ELSE 0 END), 0) AS income_total,
-             SUM(CASE WHEN payment_method = 'EXEMPT' THEN 1 ELSE 0 END) AS exempt_total
+             SUM(CASE WHEN payment_method = 'EXEMPT' THEN 1 ELSE 0 END) AS exempt_total,
+             SUM(CASE WHEN camera_validated_at_utc IS NOT NULL THEN 1 ELSE 0 END) AS camera_validated_total
       FROM operations o WHERE o.trip_id = ? AND o.active_in_trip = 1 AND o.status NOT IN ('ANNULLED','REMOVED') AND EXISTS (SELECT 1 FROM trips tx WHERE tx.id = o.trip_id AND tx.deleted_at_utc IS NULL)
     `, [req.params.tripId]);
     const [byType] = await pool.execute(`
@@ -434,7 +435,8 @@ router.get('/trip/:tripId/summary', async (req, res, next) => {
     const combinedSummary = {
       total_operations: Number(individualSummary.total_operations || 0) + Number(aggregateSummary.total_operations || 0),
       income_total: centsToMoney(moneyToCents(individualSummary.income_total || 0) + moneyToCents(aggregateSummary.income_total || 0)),
-      exempt_total: Number(individualSummary.exempt_total || 0)
+      exempt_total: Number(individualSummary.exempt_total || 0),
+      camera_validated_total: Number(individualSummary.camera_validated_total || 0)
     };
     res.json({ success: true, data: { summary: combinedSummary, by_type: mergeVehicleTypeTotals(byType, batchByType) } });
   } catch (error) { next(error); }

@@ -9,6 +9,7 @@ import { normalizePlate, validatePlate, validatePlateMatchesVehicleType } from '
 import { createNotification, publishNotification } from '../notifications/notification.service.js';
 import { emitToAdmins, emitToOperations } from '../../sockets/index.js';
 import { centsToMoney, moneyToCents } from '../../utils/money.js';
+import { attachPendingReading, releaseReadingsOfOperation } from '../camview/camview.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -764,6 +765,8 @@ router.post('/register', allowRoles('CASHIER','OPERATOR','ADMIN'), setUploadFold
       const opId = insertOp.insertId;
       const ticketNumber = ticketNumberFor(opId);
       await conn.execute('UPDATE operations SET ticket_number = ?, invoice_number = ? WHERE id = ?', [ticketNumber, ticketNumber, opId]);
+      // Validacion pasiva con camara: si CAMVIEW ya vio esta placa en el trayecto, el ticket nace validado.
+      await attachPendingReading(conn, { tripId, plate: normalizedPlate, operationId: opId });
       await conn.execute('INSERT INTO operation_events (operation_id, event_type, user_id, details_json) VALUES (?, ?, ?, ?)', [opId, 'REGISTERED_AND_TICKETED', req.user.id, JSON.stringify({ price, loadStatus, paymentMethod, billingKind, journey_free_pass_id: freePass?.id || null, ticketNumber, admin_closed_trip_correction: isAdminClosedTripCorrection })]);
 
       const [opRows] = await conn.execute(`${operationSelect} WHERE o.id = ?`, [opId]);
@@ -866,6 +869,7 @@ router.post('/:id/remove-from-trip', allowRoles('ADMIN'), async (req, res, next)
         WHERE id = ?
       `, [req.user.id, reason, op.id]);
       await conn.execute('INSERT INTO operation_events (operation_id, event_type, user_id, details_json) VALUES (?, ?, ?, ?)', [op.id, 'REMOVED_FROM_TRIP', req.user.id, JSON.stringify({ reason })]);
+      await releaseReadingsOfOperation(conn, op.id);
       notification = await createNotification(conn, {
         type: 'vehicle:removed_from_trip', severity: 'WARNING', title: 'Vehículo retirado del trayecto',
         message: `${req.user.name} retiró ${op.normalized_plate} del trayecto sin borrar el ticket histórico.`,
@@ -895,6 +899,7 @@ router.post('/:id/cancel', allowRoles('ADMIN'), async (req, res, next) => {
         WHERE id = ?
       `, [reason, req.user.id, op.id]);
       await conn.execute('INSERT INTO operation_events (operation_id, event_type, user_id, details_json) VALUES (?, ?, ?, ?)', [op.id, 'CANCELLED', req.user.id, JSON.stringify({ reason })]);
+      await releaseReadingsOfOperation(conn, op.id);
       notification = await createNotification(conn, {
         type: 'ticket:cancelled', severity: 'DANGER', title: 'Ticket anulado',
         message: `${req.user.name} anuló ${op.ticket_number || op.invoice_number} - ${op.normalized_plate}. Motivo: ${reason}`,

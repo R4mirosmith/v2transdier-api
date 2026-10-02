@@ -7,6 +7,8 @@ import { AppError } from '../../utils/errors.js';
 import { createNotification, publishNotification } from '../notifications/notification.service.js';
 import { emitToOperations } from '../../sockets/index.js';
 import { centsToMoney, moneyToCents } from '../../utils/money.js';
+import { env } from '../../config/env.js';
+import { releaseReadingsOfTrip } from '../camview/camview.service.js';
 
 const router = Router();
 router.use(authRequired);
@@ -127,6 +129,12 @@ router.get('/journey/:journeyId/detail', async (req, res, next) => {
         ou.name AS opened_by_name, cu.name AS closed_by_name, du.name AS deleted_by_name,
         (${tripIncomeExpression('o')} + ${batchIncomeExpression('t')}) AS income_total,
         (COUNT(o.id) + ${batchVehicleCountExpression('t')}) AS operations_total,
+        SUM(CASE WHEN o.camera_validated_at_utc IS NOT NULL THEN 1 ELSE 0 END) AS camera_validated_total,
+        (SELECT COUNT(DISTINCT cr.normalized_plate) FROM camera_readings cr
+          WHERE cr.trip_id = t.id AND cr.operation_id IS NULL
+            AND cr.confidence >= ${Number(env.camview.unmatchedMinConfidence).toFixed(4)}
+            AND NOT EXISTS (SELECT 1 FROM camera_readings cr2 WHERE cr2.trip_id = t.id
+                            AND cr2.normalized_plate = cr.normalized_plate AND cr2.operation_id IS NOT NULL)) AS camera_unmatched_total,
         0 AS removed_total
       FROM trips t
       JOIN companies c ON c.id = t.company_id
@@ -387,6 +395,7 @@ router.post('/:id/deactivate', allowRoles('ADMIN'), async (req, res, next) => {
         FROM operations
         WHERE trip_id = ?
       `, [req.user.id, reason, req.params.id]);
+      await releaseReadingsOfTrip(conn, req.params.id);
 
       notification = await createNotification(conn, {
         type: 'trip:deactivated', severity: 'WARNING', title: 'Trayecto desactivado',

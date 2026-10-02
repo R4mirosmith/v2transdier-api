@@ -16,6 +16,11 @@ export const env = {
   frontendOrigin: process.env.FRONTEND_ORIGIN || 'http://localhost:5173',
   publicBaseUrl: process.env.PUBLIC_BASE_URL || 'http://localhost:4010',
   uploadDir: process.env.UPLOAD_DIR || 'uploads',
+  camview: {
+    // Confianza minima del OCR para mostrar una lectura como 'vista sin ticket'.
+    // Las lecturas se guardan todas; esto solo filtra el ruido en pantalla y conteos.
+    unmatchedMinConfidence: Math.min(1, Math.max(0, Number(process.env.CAMVIEW_UNMATCHED_MIN_CONFIDENCE || 0.8) || 0.8))
+  },
   webPush: {
     subject: process.env.VAPID_SUBJECT || '',
     publicKey: process.env.VAPID_PUBLIC_KEY || '',
